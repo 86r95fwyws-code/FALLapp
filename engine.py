@@ -2794,6 +2794,108 @@ def load_full_season_fixture_catalog(
     ).reset_index(drop=True)
 
 
+
+def next_pending_round(
+    schedule: pd.DataFrame,
+    results: pd.DataFrame,
+    competition: str,
+    reference_date=None,
+) -> int:
+    """
+    Kies automatisch de eerstvolgende nog niet afgeronde speelronde.
+
+    Belangrijk:
+    - volledig gespeelde rondes worden overgeslagen;
+    - een oude uitgestelde wedstrijd in een eerdere ronde trekt de selectie niet
+      automatisch terug als de geplande datum al ruim in het verleden ligt;
+    - van de resterende rondes wint de ronde met de eerstvolgende relevante
+      speeldatum.
+    """
+    comp_schedule = schedule[schedule["Competition"] == competition].copy()
+    if comp_schedule.empty:
+        return 1
+
+    comp_schedule["Round"] = pd.to_numeric(
+        comp_schedule["Round"], errors="coerce"
+    )
+    comp_schedule["Date"] = pd.to_datetime(
+        comp_schedule["Date"], errors="coerce"
+    ).dt.normalize()
+    comp_schedule = comp_schedule[
+        comp_schedule["Round"].notna() & comp_schedule["Date"].notna()
+    ].copy()
+    if comp_schedule.empty:
+        return 1
+
+    rounds = sorted(comp_schedule["Round"].astype(int).unique().tolist())
+    today = (
+        pd.Timestamp(reference_date).normalize()
+        if reference_date is not None
+        else pd.Timestamp.now().normalize()
+    )
+
+    comp_results = results[results["Competition"] == competition].copy()
+    if not comp_results.empty:
+        comp_results["Date"] = pd.to_datetime(
+            comp_results["Date"], errors="coerce"
+        ).dt.normalize()
+
+    played = set()
+    for row in comp_results.itertuples():
+        try:
+            h = resolve_catalog_team_name(
+                results, competition, str(row.HomeTeam)
+            )
+            a = resolve_catalog_team_name(
+                results, competition, str(row.AwayTeam)
+            )
+            played.add((h, a, pd.Timestamp(row.Date).normalize()))
+        except Exception:
+            continue
+
+    candidates = []
+    old_incomplete = []
+
+    for rn in rounds:
+        group = comp_schedule[
+            comp_schedule["Round"].astype(int) == int(rn)
+        ].copy()
+
+        pending_rows = []
+        for row in group.itertuples():
+            h = resolve_catalog_team_name(
+                results, competition, str(row.HomeTeam)
+            )
+            a = resolve_catalog_team_name(
+                results, competition, str(row.AwayTeam)
+            )
+            key = (h, a, pd.Timestamp(row.Date).normalize())
+            if key not in played:
+                pending_rows.append(row)
+
+        if not pending_rows:
+            continue
+
+        pending_dates = pd.Series(
+            [pd.Timestamp(r.Date).normalize() for r in pending_rows]
+        )
+
+        # Gisteren / vandaag telt nog als de huidige ronde; daarna alleen toekomst.
+        relevant = pending_dates[pending_dates >= today - pd.Timedelta(days=1)]
+        if len(relevant):
+            candidates.append((relevant.min(), int(rn)))
+        else:
+            old_incomplete.append(int(rn))
+
+    if candidates:
+        candidates.sort(key=lambda x: (x[0], x[1]))
+        return int(candidates[0][1])
+
+    if old_incomplete:
+        return int(min(old_incomplete))
+
+    return int(rounds[-1])
+
 def season_week_keys(
     start_date: str = "2026-08-01",
     end_date: str = "2027-06-27",

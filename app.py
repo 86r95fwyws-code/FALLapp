@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import uuid
+import json
 from datetime import datetime
 
 import numpy as np
@@ -17,6 +18,7 @@ from engine import (
     fixture_bet_candidates,
     load_data,
     load_full_season_fixture_catalog,
+    next_pending_round,
     performance,
     predict_fixture,
     resolve_catalog_team_name,
@@ -164,6 +166,9 @@ exposure_pct = exposure_pct_input / 100
 if "bet_log" not in st.session_state:
     st.session_state.bet_log = empty_bet_log()
 
+if "fold_legs" not in st.session_state:
+    st.session_state.fold_legs = []
+
 # Bekende bets automatisch afrekenen wanneer Football-Data de uitslag inmiddels bevat.
 st.session_state.bet_log = auto_settle_bets(
     st.session_state.bet_log, results, resolve_catalog_team_name
@@ -180,32 +185,25 @@ with tabs[0]:
     c1, c2, c3 = st.columns([1.35, 1, 1])
     competition = c1.selectbox("Competitie", ALL_COMPETITIONS, key="start_comp")
     comp_schedule = schedule[schedule["Competition"] == competition].copy()
-    rounds = sorted(comp_schedule["Round"].dropna().astype(int).unique().tolist())
+    rounds = sorted(
+        comp_schedule["Round"].dropna().astype(int).unique().tolist()
+    )
 
-    # Kies standaard eerste ronde met minstens één nog niet gespeelde wedstrijd.
-    default_round = rounds[0] if rounds else 1
-    comp_results = results[results["Competition"] == competition]
-    played = {
-        (resolve_catalog_team_name(results, competition, r.HomeTeam),
-         resolve_catalog_team_name(results, competition, r.AwayTeam),
-         pd.Timestamp(r.Date).normalize())
-        for r in comp_results.itertuples()
-    }
-    for rn in rounds:
-        group = comp_schedule[comp_schedule["Round"] == rn]
-        pending = False
-        for r in group.itertuples():
-            h = resolve_catalog_team_name(results, competition, r.HomeTeam)
-            a = resolve_catalog_team_name(results, competition, r.AwayTeam)
-            if (h, a, pd.Timestamp(r.Date).normalize()) not in played:
-                pending = True
-                break
-        if pending:
-            default_round = rn
-            break
-
+    default_round = next_pending_round(
+        schedule,
+        results,
+        competition,
+    )
+    round_key = f"start_round_{competition}"
     selected_round = c2.selectbox(
-        "Speelronde", rounds, index=rounds.index(default_round) if default_round in rounds else 0
+        "Speelronde",
+        rounds,
+        index=(
+            rounds.index(default_round)
+            if default_round in rounds
+            else 0
+        ),
+        key=round_key,
     )
     threshold_pct = c3.number_input(
         "Min. modelkans (%)", min_value=50, max_value=99, value=int(threshold_sidebar), step=1
@@ -441,169 +439,908 @@ with tabs[0]:
 # MIJN BETS
 # =============================================================================
 with tabs[1]:
-    st.subheader("Mijn bets per speelronde")
+    st.subheader("Mijn bets")
+
     st.info(
-        "De betlog staat in je huidige Streamlit-sessie. Download na wijzigingen de CSV-backup. "
-        "Daarmee voorkom je dat je gegevens kwijtraakt als de gratis app opnieuw opstart."
+        "Je kunt hier losse bets én folds/combi's opslaan. "
+        "Open inzet wordt direct van je beschikbare bankroll afgetrokken."
     )
 
-    upload = st.file_uploader("Importeer betlog-backup", type=["csv"])
+    upload = st.file_uploader(
+        "Importeer betlog-backup",
+        type=["csv"],
+        key="betlog_upload",
+    )
     if upload is not None:
         try:
-            st.session_state.bet_log = normalise_bet_log(pd.read_csv(upload))
+            st.session_state.bet_log = normalise_bet_log(
+                pd.read_csv(upload)
+            )
             st.success("Betlog geïmporteerd.")
         except Exception as exc:
             st.error(f"Importeren mislukt: {exc}")
 
-    b1, b2 = st.columns(2)
-    bet_comp = b1.selectbox("Competitie", ALL_COMPETITIONS, key="bet_comp")
-    bs = schedule[schedule["Competition"] == bet_comp]
-    bet_rounds = sorted(bs["Round"].dropna().astype(int).unique().tolist())
-    bet_round = b2.selectbox("Speelronde", bet_rounds, key="bet_round")
-
-    fixtures = bs[bs["Round"] == bet_round].sort_values("DateTime")
-    selected_match = st.selectbox("Wedstrijd", fixtures["Match"].tolist(), key="bet_match")
-    fixture = fixtures[fixtures["Match"] == selected_match].iloc[0]
-
-    # Toon alle markten vanaf 50%, zodat gebruiker zelf kiest.
-    choices = fixture_bet_candidates(
-        results,
-        competition=bet_comp,
-        fixture_date=fixture["Date"],
-        home_team=fixture["HomeTeam"],
-        away_team=fixture["AwayTeam"],
-        mode="Huidig seizoen",
-        pseudo=pseudo,
-        threshold=0.50,
-        max_goals=8,
-        market_scope="0.5-5.5",
+    # Altijd bovenaan zichtbaar: bankroll na singles + folds.
+    bet_summary = current_bankroll_summary(
+        st.session_state.bet_log,
+        start_bankroll,
+        secure_pct,
+        exposure_pct,
+    )
+    bm1, bm2, bm3, bm4 = st.columns(4)
+    bm1.metric(
+        "Actieve bankroll",
+        eur(bet_summary["active_bankroll"]),
+    )
+    bm2.metric(
+        "Open inzet",
+        eur(bet_summary.get("open_stake", 0.0)),
+    )
+    bm3.metric(
+        "Max. inzetbudget",
+        eur(bet_summary.get("gross_stake_budget", 0.0)),
+    )
+    bm4.metric(
+        "Nog inzetbaar",
+        eur(bet_summary["available_to_stake"]),
     )
 
-    if choices.empty:
-        st.warning("Geen modelmarkten beschikbaar voor deze wedstrijd.")
-    else:
-        labels = [f"{r.Bet} · {pct_nl(r.ModelProb)} · fair {r.FairOdd:.2f}" for r in choices.itertuples()]
-        choice_label = st.selectbox("Bet", labels)
-        selected = choices.iloc[labels.index(choice_label)]
+    bet_mode = st.radio(
+        "Wat wil je toevoegen?",
+        ["Single bet", "Fold / combi"],
+        horizontal=True,
+        key="bet_mode",
+    )
 
-        iso = pd.Timestamp(fixture["Date"]).isocalendar()
-        week_key = f"{iso.year}-W{int(iso.week):02d}"
-        summary = current_bankroll_summary(
-            st.session_state.bet_log, start_bankroll, secure_pct, exposure_pct
+    # -----------------------------------------------------------------
+    # SINGLE BET
+    # -----------------------------------------------------------------
+    if bet_mode == "Single bet":
+        st.markdown("### Single bet")
+
+        b1, b2 = st.columns(2)
+        bet_comp = b1.selectbox(
+            "Competitie",
+            ALL_COMPETITIONS,
+            key="bet_comp",
         )
 
-        # Probeer TOTO voor deze ene match te vullen.
-        single_toto = cached_toto_week(bet_comp, ((fixture["HomeTeam"], fixture["AwayTeam"]),))
-        toto = toto_week_result_for_match(single_toto, fixture["HomeTeam"], fixture["AwayTeam"])
-        selected_df = attach_toto_odds(pd.DataFrame([selected]), toto)
-        toto_odd = pd.to_numeric(selected_df.iloc[0].get("TotoOdd"), errors="coerce")
-        default_odd = float(toto_odd) if pd.notna(toto_odd) and toto_odd > 1 else float(selected["FairOdd"])
-
-        m1, m2, m3 = st.columns(3)
-        m1.metric("Beschikbaar inzetbudget", eur(summary["available_to_stake"]))
-        m2.metric("Modelkans", pct_nl(selected["ModelProb"]))
-        m3.metric("Fair odd", f"{selected['FairOdd']:.2f}")
-
-        i1, i2 = st.columns(2)
-        bookmaker_odd = i1.number_input(
-            "Bookmaker odd", min_value=1.01, max_value=1000.0,
-            value=max(1.01, round(default_odd, 2)), step=0.01,
+        bs = schedule[
+            schedule["Competition"] == bet_comp
+        ].copy()
+        bet_rounds = sorted(
+            bs["Round"].dropna().astype(int).unique().tolist()
         )
-        max_stake = max(float(summary["available_to_stake"]), 0.01)
-        stake = i2.number_input(
-            "Inzet", min_value=0.01, max_value=max_stake,
-            value=min(5.0, max_stake), step=0.50,
-        )
-        model_value = float(selected["ModelProb"]) * bookmaker_odd - 1
-        st.caption(
-            f"Model-value bij deze odd: {pct_nl(model_value)} · week {week_key}."
+        default_bet_round = next_pending_round(
+            schedule,
+            results,
+            bet_comp,
         )
 
-        if st.button("＋ Bet toevoegen", type="primary"):
-            new = pd.DataFrame([{
-                "BetID": str(uuid.uuid4())[:8],
-                "CreatedAt": datetime.now().isoformat(timespec="seconds"),
-                "Competition": bet_comp,
-                "Round": int(bet_round),
-                "WeekKey": week_key,
-                "Date": fixture["Date"],
-                "Match": fixture["Match"],
-                "HomeTeam": fixture["HomeTeam"],
-                "AwayTeam": fixture["AwayTeam"],
-                "Bet": selected["Bet"],
-                "ModelProb": float(selected["ModelProb"]),
-                "FairOdd": float(selected["FairOdd"]),
-                "BookmakerOdd": bookmaker_odd,
-                "Stake": stake,
-                "Status": "Open",
-                "Return": np.nan,
-                "Profit": np.nan,
-            }])
-            st.session_state.bet_log = pd.concat(
-                [st.session_state.bet_log, new], ignore_index=True
+        bet_round = b2.selectbox(
+            "Speelronde",
+            bet_rounds,
+            index=(
+                bet_rounds.index(default_bet_round)
+                if default_bet_round in bet_rounds
+                else 0
+            ),
+            key=f"bet_round_{bet_comp}",
+        )
+
+        fixtures = bs[
+            bs["Round"] == bet_round
+        ].sort_values("DateTime")
+
+        if fixtures.empty:
+            st.warning("Geen wedstrijden in deze speelronde.")
+        else:
+            selected_match = st.selectbox(
+                "Wedstrijd",
+                fixtures["Match"].tolist(),
+                key=f"bet_match_{bet_comp}_{bet_round}",
             )
-            st.success("Bet toegevoegd.")
-            st.rerun()
+            fixture = fixtures[
+                fixtures["Match"] == selected_match
+            ].iloc[0]
 
+            choices = fixture_bet_candidates(
+                results,
+                competition=bet_comp,
+                fixture_date=fixture["Date"],
+                home_team=fixture["HomeTeam"],
+                away_team=fixture["AwayTeam"],
+                mode="Huidig seizoen",
+                pseudo=pseudo,
+                threshold=0.50,
+                max_goals=8,
+                market_scope="0.5-5.5",
+            )
+
+            if choices.empty:
+                st.warning(
+                    "Geen modelmarkten beschikbaar voor deze wedstrijd."
+                )
+            else:
+                choices = choices.sort_values(
+                    ["ModelProb", "Category", "Bet"],
+                    ascending=[True, True, True],
+                    kind="stable",
+                ).reset_index(drop=True)
+
+                single_toto = cached_toto_week(
+                    bet_comp,
+                    ((fixture["HomeTeam"], fixture["AwayTeam"]),),
+                )
+                toto = toto_week_result_for_match(
+                    single_toto,
+                    fixture["HomeTeam"],
+                    fixture["AwayTeam"],
+                )
+                choices = attach_toto_odds(
+                    choices,
+                    toto,
+                )
+
+                labels = []
+                for row in choices.itertuples():
+                    toto_text = (
+                        f" · TOTO {row.TotoOdd:.2f}"
+                        if pd.notna(row.TotoOdd)
+                        else ""
+                    )
+                    labels.append(
+                        f"{row.Bet} · {pct_nl(row.ModelProb)}"
+                        f" · fair {row.FairOdd:.2f}{toto_text}"
+                    )
+
+                choice_label = st.selectbox(
+                    "Bet",
+                    labels,
+                    key=f"single_choice_{bet_comp}_{bet_round}_{selected_match}",
+                )
+                selected = choices.iloc[
+                    labels.index(choice_label)
+                ]
+
+                toto_odd = pd.to_numeric(
+                    pd.Series([selected.get("TotoOdd")]),
+                    errors="coerce",
+                ).iloc[0]
+                default_odd = (
+                    float(toto_odd)
+                    if pd.notna(toto_odd) and toto_odd > 1
+                    else float(selected["FairOdd"])
+                )
+
+                m1, m2, m3 = st.columns(3)
+                m1.metric(
+                    "Nog inzetbaar",
+                    eur(bet_summary["available_to_stake"]),
+                )
+                m2.metric(
+                    "Modelkans",
+                    pct_nl(selected["ModelProb"]),
+                )
+                m3.metric(
+                    "Fair odd",
+                    f"{selected['FairOdd']:.2f}",
+                )
+
+                i1, i2 = st.columns(2)
+                bookmaker_odd = i1.number_input(
+                    "Bookmaker odd",
+                    min_value=1.01,
+                    max_value=1000.0,
+                    value=max(
+                        1.01,
+                        round(default_odd, 2),
+                    ),
+                    step=0.01,
+                    key=f"single_odd_{bet_comp}_{bet_round}_{selected_match}",
+                )
+
+                available = float(
+                    bet_summary["available_to_stake"]
+                )
+                if available <= 0:
+                    st.error(
+                        "Je hebt momenteel geen inzetruimte meer in je bankroll."
+                    )
+                    stake = 0.0
+                else:
+                    stake = i2.number_input(
+                        "Inzet",
+                        min_value=0.01,
+                        max_value=max(0.01, available),
+                        value=min(5.0, available),
+                        step=0.50,
+                        key=f"single_stake_{bet_comp}_{bet_round}_{selected_match}",
+                    )
+
+                model_value = (
+                    float(selected["ModelProb"])
+                    * bookmaker_odd
+                    - 1
+                )
+                iso = pd.Timestamp(
+                    fixture["Date"]
+                ).isocalendar()
+                week_key = (
+                    f"{iso.year}-W{int(iso.week):02d}"
+                )
+
+                st.caption(
+                    f"Model-value: {pct_nl(model_value)} · "
+                    f"bankrollweek {week_key}."
+                )
+
+                if st.button(
+                    "＋ Single toevoegen",
+                    type="primary",
+                    disabled=available <= 0,
+                    key="add_single",
+                ):
+                    new = pd.DataFrame([{
+                        "BetID": str(uuid.uuid4())[:8],
+                        "BetType": "Single",
+                        "LegCount": 1,
+                        "FoldLegsJSON": "",
+                        "CreatedAt": datetime.now().isoformat(
+                            timespec="seconds"
+                        ),
+                        "Competition": bet_comp,
+                        "Round": int(bet_round),
+                        "WeekKey": week_key,
+                        "Date": fixture["Date"],
+                        "Match": fixture["Match"],
+                        "HomeTeam": fixture["HomeTeam"],
+                        "AwayTeam": fixture["AwayTeam"],
+                        "Bet": selected["Bet"],
+                        "ModelProb": float(
+                            selected["ModelProb"]
+                        ),
+                        "FairOdd": float(
+                            selected["FairOdd"]
+                        ),
+                        "BookmakerOdd": bookmaker_odd,
+                        "Stake": stake,
+                        "Status": "Open",
+                        "Return": np.nan,
+                        "Profit": np.nan,
+                    }])
+
+                    st.session_state.bet_log = pd.concat(
+                        [
+                            normalise_bet_log(
+                                st.session_state.bet_log
+                            ),
+                            normalise_bet_log(new),
+                        ],
+                        ignore_index=True,
+                    )
+                    st.success("Single toegevoegd.")
+                    st.rerun()
+
+    # -----------------------------------------------------------------
+    # FOLD / COMBI
+    # -----------------------------------------------------------------
+    else:
+        st.markdown("### Fold / combi")
+        st.caption(
+            "Combineer bets uit verschillende wedstrijden en competities. "
+            "De totale bookmakerodd wordt vermenigvuldigd. "
+            "De gecombineerde modelkans is een benadering door de kansen "
+            "van verschillende wedstrijden te vermenigvuldigen."
+        )
+
+        f1, f2 = st.columns(2)
+        fold_comp = f1.selectbox(
+            "Competitie voor nieuwe leg",
+            ALL_COMPETITIONS,
+            key="fold_comp",
+        )
+        fs = schedule[
+            schedule["Competition"] == fold_comp
+        ].copy()
+        fold_rounds = sorted(
+            fs["Round"].dropna().astype(int).unique().tolist()
+        )
+        default_fold_round = next_pending_round(
+            schedule,
+            results,
+            fold_comp,
+        )
+        fold_round = f2.selectbox(
+            "Speelronde",
+            fold_rounds,
+            index=(
+                fold_rounds.index(default_fold_round)
+                if default_fold_round in fold_rounds
+                else 0
+            ),
+            key=f"fold_round_{fold_comp}",
+        )
+
+        fold_fixtures = fs[
+            fs["Round"] == fold_round
+        ].sort_values("DateTime")
+
+        if fold_fixtures.empty:
+            st.warning("Geen wedstrijden in deze ronde.")
+        else:
+            fold_match = st.selectbox(
+                "Wedstrijd voor nieuwe leg",
+                fold_fixtures["Match"].tolist(),
+                key=f"fold_match_{fold_comp}_{fold_round}",
+            )
+            fold_fixture = fold_fixtures[
+                fold_fixtures["Match"] == fold_match
+            ].iloc[0]
+
+            fold_choices = fixture_bet_candidates(
+                results,
+                competition=fold_comp,
+                fixture_date=fold_fixture["Date"],
+                home_team=fold_fixture["HomeTeam"],
+                away_team=fold_fixture["AwayTeam"],
+                mode="Huidig seizoen",
+                pseudo=pseudo,
+                threshold=0.50,
+                max_goals=8,
+                market_scope="0.5-5.5",
+            )
+
+            if not fold_choices.empty:
+                fold_choices = fold_choices.sort_values(
+                    ["ModelProb", "Category", "Bet"],
+                    ascending=[True, True, True],
+                    kind="stable",
+                ).reset_index(drop=True)
+
+                fold_toto_week = cached_toto_week(
+                    fold_comp,
+                    ((
+                        fold_fixture["HomeTeam"],
+                        fold_fixture["AwayTeam"],
+                    ),),
+                )
+                fold_toto = toto_week_result_for_match(
+                    fold_toto_week,
+                    fold_fixture["HomeTeam"],
+                    fold_fixture["AwayTeam"],
+                )
+                fold_choices = attach_toto_odds(
+                    fold_choices,
+                    fold_toto,
+                )
+
+                fold_labels = []
+                for row in fold_choices.itertuples():
+                    toto_text = (
+                        f" · TOTO {row.TotoOdd:.2f}"
+                        if pd.notna(row.TotoOdd)
+                        else ""
+                    )
+                    fold_labels.append(
+                        f"{row.Bet} · {pct_nl(row.ModelProb)}"
+                        f" · fair {row.FairOdd:.2f}{toto_text}"
+                    )
+
+                fold_choice_label = st.selectbox(
+                    "Bet voor nieuwe leg",
+                    fold_labels,
+                    key=(
+                        f"fold_choice_{fold_comp}_"
+                        f"{fold_round}_{fold_match}"
+                    ),
+                )
+                fold_selected = fold_choices.iloc[
+                    fold_labels.index(
+                        fold_choice_label
+                    )
+                ]
+
+                fold_toto_odd = pd.to_numeric(
+                    pd.Series([
+                        fold_selected.get("TotoOdd")
+                    ]),
+                    errors="coerce",
+                ).iloc[0]
+                fold_default_odd = (
+                    float(fold_toto_odd)
+                    if pd.notna(fold_toto_odd)
+                    and fold_toto_odd > 1
+                    else float(
+                        fold_selected["FairOdd"]
+                    )
+                )
+
+                leg_odd = st.number_input(
+                    "Odd van deze leg",
+                    min_value=1.01,
+                    max_value=1000.0,
+                    value=max(
+                        1.01,
+                        round(fold_default_odd, 2),
+                    ),
+                    step=0.01,
+                    key=(
+                        f"fold_leg_odd_{fold_comp}_"
+                        f"{fold_round}_{fold_match}"
+                    ),
+                )
+
+                existing_matches = {
+                    str(leg.get("Match"))
+                    for leg in st.session_state.fold_legs
+                }
+                duplicate_match = (
+                    str(fold_fixture["Match"])
+                    in existing_matches
+                )
+
+                if duplicate_match:
+                    st.warning(
+                        "Deze wedstrijd zit al in je fold. "
+                        "Een fold gebruikt hier maximaal één leg per wedstrijd."
+                    )
+
+                if st.button(
+                    "＋ Leg toevoegen",
+                    disabled=duplicate_match,
+                    key="add_fold_leg",
+                ):
+                    iso = pd.Timestamp(
+                        fold_fixture["Date"]
+                    ).isocalendar()
+                    leg_week = (
+                        f"{iso.year}-W{int(iso.week):02d}"
+                    )
+
+                    st.session_state.fold_legs.append({
+                        "LegID": str(uuid.uuid4())[:8],
+                        "Competition": fold_comp,
+                        "Round": int(fold_round),
+                        "WeekKey": leg_week,
+                        "Date": pd.Timestamp(
+                            fold_fixture["Date"]
+                        ).strftime("%Y-%m-%d"),
+                        "Match": str(
+                            fold_fixture["Match"]
+                        ),
+                        "HomeTeam": str(
+                            fold_fixture["HomeTeam"]
+                        ),
+                        "AwayTeam": str(
+                            fold_fixture["AwayTeam"]
+                        ),
+                        "Bet": str(
+                            fold_selected["Bet"]
+                        ),
+                        "ModelProb": float(
+                            fold_selected["ModelProb"]
+                        ),
+                        "FairOdd": float(
+                            fold_selected["FairOdd"]
+                        ),
+                        "BookmakerOdd": float(
+                            leg_odd
+                        ),
+                    })
+                    st.rerun()
+            else:
+                st.warning(
+                    "Geen modelmarkten beschikbaar voor deze wedstrijd."
+                )
+
+        st.divider()
+        st.markdown("#### Huidige fold")
+
+        legs = list(st.session_state.fold_legs)
+        if not legs:
+            st.caption(
+                "Voeg minimaal twee legs uit verschillende wedstrijden toe."
+            )
+        else:
+            leg_df = pd.DataFrame(legs)
+            leg_df["Kans"] = leg_df[
+                "ModelProb"
+            ].apply(pct_nl)
+            st.dataframe(
+                leg_df[[
+                    "LegID", "Competition", "Round",
+                    "Match", "Bet", "Kans",
+                    "BookmakerOdd",
+                ]],
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "BookmakerOdd":
+                        st.column_config.NumberColumn(
+                            "Odd", format="%.2f"
+                        ),
+                },
+            )
+
+            remove_ids = st.multiselect(
+                "Legs verwijderen",
+                [leg["LegID"] for leg in legs],
+                format_func=lambda leg_id: next(
+                    (
+                        f"{leg['Match']} · {leg['Bet']}"
+                        for leg in legs
+                        if leg["LegID"] == leg_id
+                    ),
+                    leg_id,
+                ),
+                key="remove_fold_legs",
+            )
+            r1, r2 = st.columns(2)
+            if remove_ids and r1.button(
+                "Verwijder geselecteerde legs",
+                key="delete_fold_legs",
+            ):
+                st.session_state.fold_legs = [
+                    leg for leg in legs
+                    if leg["LegID"] not in remove_ids
+                ]
+                st.rerun()
+
+            if r2.button(
+                "Wis hele fold",
+                key="clear_fold",
+            ):
+                st.session_state.fold_legs = []
+                st.rerun()
+
+            total_odd = float(np.prod([
+                float(leg["BookmakerOdd"])
+                for leg in legs
+            ]))
+            combined_prob = float(np.prod([
+                float(leg["ModelProb"])
+                for leg in legs
+            ]))
+            combined_fair = (
+                1.0 / combined_prob
+                if combined_prob > 0
+                else np.nan
+            )
+
+            fm1, fm2, fm3 = st.columns(3)
+            fm1.metric(
+                "Totale fold odd",
+                f"{total_odd:.2f}",
+            )
+            fm2.metric(
+                "Geschatte modelkans",
+                pct_nl(combined_prob),
+            )
+            fm3.metric(
+                "Fair odd gecombineerd",
+                (
+                    f"{combined_fair:.2f}"
+                    if pd.notna(combined_fair)
+                    else "–"
+                ),
+            )
+
+            fold_available = float(
+                bet_summary["available_to_stake"]
+            )
+            if fold_available <= 0:
+                st.error(
+                    "Je hebt geen inzetruimte meer."
+                )
+                fold_stake = 0.0
+            else:
+                fold_stake = st.number_input(
+                    "Inzet op deze fold",
+                    min_value=0.01,
+                    max_value=max(
+                        0.01,
+                        fold_available,
+                    ),
+                    value=min(
+                        5.0,
+                        fold_available,
+                    ),
+                    step=0.50,
+                    key="fold_stake",
+                )
+
+            possible_return = (
+                fold_stake * total_odd
+                if fold_stake > 0
+                else 0.0
+            )
+            st.metric(
+                "Mogelijke uitbetaling",
+                eur(possible_return),
+            )
+
+            leg_weeks = sorted({
+                str(leg["WeekKey"])
+                for leg in legs
+            })
+            if len(leg_weeks) > 1:
+                st.warning(
+                    "Deze fold bevat wedstrijden uit meerdere ISO-weken. "
+                    "De inzet wordt voor je bankroll toegewezen aan de week "
+                    "van de vroegste leg en blijft open tot de fold beslist is."
+                )
+
+            if st.button(
+                "＋ Fold toevoegen",
+                type="primary",
+                disabled=(
+                    len(legs) < 2
+                    or fold_available <= 0
+                ),
+                key="save_fold",
+            ):
+                sorted_legs = sorted(
+                    legs,
+                    key=lambda x: x["Date"],
+                )
+                first_leg = sorted_legs[0]
+
+                new_fold = pd.DataFrame([{
+                    "BetID": str(uuid.uuid4())[:8],
+                    "BetType": "Fold",
+                    "LegCount": len(legs),
+                    "FoldLegsJSON": json.dumps(
+                        legs,
+                        ensure_ascii=False,
+                    ),
+                    "CreatedAt": datetime.now().isoformat(
+                        timespec="seconds"
+                    ),
+                    "Competition": "Fold",
+                    "Round": np.nan,
+                    "WeekKey": first_leg["WeekKey"],
+                    "Date": first_leg["Date"],
+                    "Match": f"{len(legs)} legs",
+                    "HomeTeam": "",
+                    "AwayTeam": "",
+                    "Bet": "Fold / combi",
+                    "ModelProb": combined_prob,
+                    "FairOdd": combined_fair,
+                    "BookmakerOdd": total_odd,
+                    "Stake": fold_stake,
+                    "Status": "Open",
+                    "Return": np.nan,
+                    "Profit": np.nan,
+                }])
+
+                st.session_state.bet_log = pd.concat(
+                    [
+                        normalise_bet_log(
+                            st.session_state.bet_log
+                        ),
+                        normalise_bet_log(
+                            new_fold
+                        ),
+                    ],
+                    ignore_index=True,
+                )
+                st.session_state.fold_legs = []
+                st.success(
+                    "Fold toegevoegd. Je resterende bankroll is bijgewerkt."
+                )
+                st.rerun()
+
+    # -----------------------------------------------------------------
+    # OPGESLAGEN BETS / FOLDS
+    # -----------------------------------------------------------------
     st.divider()
-    log = recalculate_log(st.session_state.bet_log)
+    log = recalculate_log(
+        st.session_state.bet_log
+    )
     st.session_state.bet_log = log
 
     if log.empty:
         st.caption("Nog geen bets opgeslagen.")
     else:
-        f1, f2, f3 = st.columns(3)
-        fcomp = f1.selectbox("Filter competitie", ["Alle"] + ALL_COMPETITIONS)
-        fr_values = sorted(log["Round"].dropna().astype(int).unique().tolist())
-        fround = f2.selectbox("Filter ronde", ["Alle"] + fr_values)
-        fstatus = f3.selectbox("Status", ["Alle", "Open", "Gewonnen", "Verloren", "Void"])
+        f1, f2, f3, f4 = st.columns(4)
+
+        ftype = f1.selectbox(
+            "Type",
+            ["Alle", "Single", "Fold"],
+            key="log_type_filter",
+        )
+        comp_options = (
+            ["Alle", "Fold"] + ALL_COMPETITIONS
+        )
+        fcomp = f2.selectbox(
+            "Competitie",
+            comp_options,
+            key="log_comp_filter",
+        )
+        round_values = sorted(
+            log["Round"].dropna().astype(int).unique().tolist()
+        )
+        fround = f3.selectbox(
+            "Ronde",
+            ["Alle"] + round_values,
+            key="log_round_filter",
+        )
+        fstatus = f4.selectbox(
+            "Status",
+            ["Alle", "Open", "Gewonnen", "Verloren", "Void"],
+            key="log_status_filter",
+        )
 
         filtered = log.copy()
-        if fcomp != "Alle": filtered = filtered[filtered["Competition"] == fcomp]
-        if fround != "Alle": filtered = filtered[filtered["Round"] == int(fround)]
-        if fstatus != "Alle": filtered = filtered[filtered["Status"] == fstatus]
+        if ftype != "Alle":
+            filtered = filtered[
+                filtered["BetType"] == ftype
+            ]
+        if fcomp != "Alle":
+            filtered = filtered[
+                filtered["Competition"] == fcomp
+            ]
+        if fround != "Alle":
+            filtered = filtered[
+                filtered["Round"] == int(fround)
+            ]
+        if fstatus != "Alle":
+            filtered = filtered[
+                filtered["Status"] == fstatus
+            ]
 
         editor = filtered.copy()
-        editor["Kans"] = editor["ModelProb"].apply(pct_nl)
+        editor["Kans"] = editor[
+            "ModelProb"
+        ].apply(pct_nl)
         editor = editor[[
-            "BetID", "Competition", "Round", "WeekKey", "Match", "Bet", "Kans",
-            "FairOdd", "BookmakerOdd", "Stake", "Status", "Return", "Profit"
+            "BetID", "BetType", "LegCount",
+            "Competition", "Round", "WeekKey",
+            "Match", "Bet", "Kans", "FairOdd",
+            "BookmakerOdd", "Stake", "Status",
+            "Return", "Profit",
         ]]
+
         edited = st.data_editor(
             editor,
             use_container_width=True,
             hide_index=True,
-            disabled=["BetID", "Competition", "Round", "WeekKey", "Match", "Bet", "Kans", "FairOdd", "Return", "Profit"],
+            disabled=[
+                "BetID", "BetType", "LegCount",
+                "Competition", "Round", "WeekKey",
+                "Match", "Bet", "Kans", "FairOdd",
+                "Return", "Profit",
+            ],
             column_config={
-                "Status": st.column_config.SelectboxColumn(
-                    "Status", options=["Open", "Gewonnen", "Verloren", "Void"], required=True
-                ),
-                "BookmakerOdd": st.column_config.NumberColumn("Odd", format="%.2f"),
-                "Stake": st.column_config.NumberColumn("Inzet", format="€%.2f"),
-                "Return": st.column_config.NumberColumn("Uitbetaling", format="€%.2f"),
-                "Profit": st.column_config.NumberColumn("Winst/verlies", format="€%.2f"),
+                "LegCount":
+                    st.column_config.NumberColumn(
+                        "Legs", format="%d"
+                    ),
+                "Status":
+                    st.column_config.SelectboxColumn(
+                        "Status",
+                        options=[
+                            "Open",
+                            "Gewonnen",
+                            "Verloren",
+                            "Void",
+                        ],
+                        required=True,
+                    ),
+                "BookmakerOdd":
+                    st.column_config.NumberColumn(
+                        "Odd", format="%.2f"
+                    ),
+                "Stake":
+                    st.column_config.NumberColumn(
+                        "Inzet", format="€%.2f"
+                    ),
+                "Return":
+                    st.column_config.NumberColumn(
+                        "Uitbetaling", format="€%.2f"
+                    ),
+                "Profit":
+                    st.column_config.NumberColumn(
+                        "Winst/verlies", format="€%.2f"
+                    ),
             },
+            key="bet_log_editor",
         )
-        if st.button("Wijzigingen opslaan"):
+
+        if st.button(
+            "Wijzigingen opslaan",
+            key="save_log_changes",
+        ):
             base = st.session_state.bet_log.copy()
             for _, erow in edited.iterrows():
-                mask = base["BetID"].astype(str) == str(erow["BetID"])
-                base.loc[mask, "BookmakerOdd"] = erow["BookmakerOdd"]
-                base.loc[mask, "Stake"] = erow["Stake"]
-                base.loc[mask, "Status"] = erow["Status"]
-            st.session_state.bet_log = recalculate_log(base)
+                mask = (
+                    base["BetID"].astype(str)
+                    == str(erow["BetID"])
+                )
+                base.loc[
+                    mask, "BookmakerOdd"
+                ] = erow["BookmakerOdd"]
+                base.loc[
+                    mask, "Stake"
+                ] = erow["Stake"]
+                base.loc[
+                    mask, "Status"
+                ] = erow["Status"]
+
+            st.session_state.bet_log = (
+                recalculate_log(base)
+            )
             st.rerun()
 
-        delete_ids = st.multiselect("Bets verwijderen", filtered["BetID"].astype(str).tolist())
-        if delete_ids and st.button("Verwijder geselecteerde bets"):
-            st.session_state.bet_log = st.session_state.bet_log[
-                ~st.session_state.bet_log["BetID"].astype(str).isin(delete_ids)
-            ].reset_index(drop=True)
+        # Fold details.
+        folds = filtered[
+            filtered["BetType"] == "Fold"
+        ]
+        if not folds.empty:
+            st.markdown("#### Fold details")
+            for _, fold in folds.iterrows():
+                with st.expander(
+                    f"{fold['BetID']} · "
+                    f"{int(fold['LegCount']) if pd.notna(fold['LegCount']) else 0} legs · "
+                    f"odd {fold['BookmakerOdd']:.2f} · "
+                    f"{fold['Status']}"
+                ):
+                    try:
+                        legs = json.loads(
+                            str(fold["FoldLegsJSON"])
+                        )
+                    except Exception:
+                        legs = []
+
+                    if legs:
+                        detail = pd.DataFrame(legs)
+                        detail["Kans"] = detail[
+                            "ModelProb"
+                        ].apply(pct_nl)
+                        st.dataframe(
+                            detail[[
+                                "Competition",
+                                "Round",
+                                "Match",
+                                "Bet",
+                                "Kans",
+                                "BookmakerOdd",
+                            ]],
+                            use_container_width=True,
+                            hide_index=True,
+                            column_config={
+                                "BookmakerOdd":
+                                    st.column_config.NumberColumn(
+                                        "Odd",
+                                        format="%.2f",
+                                    ),
+                            },
+                        )
+
+        delete_ids = st.multiselect(
+            "Bets/folds verwijderen",
+            filtered["BetID"].astype(str).tolist(),
+            key="delete_bet_ids",
+        )
+        if delete_ids and st.button(
+            "Verwijder geselecteerde",
+            key="delete_bets",
+        ):
+            st.session_state.bet_log = (
+                st.session_state.bet_log[
+                    ~st.session_state.bet_log[
+                        "BetID"
+                    ].astype(str).isin(delete_ids)
+                ].reset_index(drop=True)
+            )
             st.rerun()
 
         st.download_button(
             "⬇ Download betlog-backup",
-            st.session_state.bet_log.to_csv(index=False).encode("utf-8"),
+            st.session_state.bet_log.to_csv(
+                index=False
+            ).encode("utf-8"),
             file_name="current_season_bets.csv",
             mime="text/csv",
             type="primary",

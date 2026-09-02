@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import json
 from typing import Iterable
 
 import numpy as np
@@ -8,9 +9,10 @@ import pandas as pd
 
 
 BET_COLUMNS = [
-    "BetID", "CreatedAt", "Competition", "Round", "WeekKey", "Date",
-    "Match", "HomeTeam", "AwayTeam", "Bet", "ModelProb", "FairOdd",
-    "BookmakerOdd", "Stake", "Status", "Return", "Profit",
+    "BetID", "BetType", "LegCount", "FoldLegsJSON", "CreatedAt",
+    "Competition", "Round", "WeekKey", "Date", "Match", "HomeTeam",
+    "AwayTeam", "Bet", "ModelProb", "FairOdd", "BookmakerOdd", "Stake",
+    "Status", "Return", "Profit",
 ]
 
 
@@ -21,17 +23,39 @@ def empty_bet_log() -> pd.DataFrame:
 def normalise_bet_log(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return empty_bet_log()
+
     out = df.copy()
     for c in BET_COLUMNS:
         if c not in out.columns:
             out[c] = np.nan
+
+    # Backwards compatibility: older CSVs are singles.
+    out["BetType"] = out["BetType"].fillna("Single").astype(str)
+    out.loc[
+        ~out["BetType"].isin(["Single", "Fold"]),
+        "BetType",
+    ] = "Single"
+
+    out["LegCount"] = pd.to_numeric(
+        out["LegCount"], errors="coerce"
+    )
+    out.loc[
+        (out["BetType"] == "Single") & out["LegCount"].isna(),
+        "LegCount",
+    ] = 1
+
+    out["FoldLegsJSON"] = out["FoldLegsJSON"].fillna("").astype(str)
     out = out[BET_COLUMNS]
-    for c in ["Round", "ModelProb", "FairOdd", "BookmakerOdd", "Stake", "Return", "Profit"]:
+
+    for c in [
+        "Round", "LegCount", "ModelProb", "FairOdd",
+        "BookmakerOdd", "Stake", "Return", "Profit",
+    ]:
         out[c] = pd.to_numeric(out[c], errors="coerce")
+
     out["Date"] = pd.to_datetime(out["Date"], errors="coerce")
     out["Status"] = out["Status"].fillna("Open").astype(str)
     return out
-
 
 def settle_return(status: str, stake: float, odd: float) -> tuple[float, float]:
     stake = float(stake or 0)
@@ -84,7 +108,97 @@ def event_won(bet: str, home_team: str, away_team: str, hg: int, ag: int):
     return None
 
 
-def auto_settle_bets(log: pd.DataFrame, results: pd.DataFrame, resolve_team_fn) -> pd.DataFrame:
+def _load_fold_legs(value) -> list[dict]:
+    if value is None:
+        return []
+    try:
+        if pd.isna(value):
+            return []
+    except Exception:
+        pass
+    if isinstance(value, list):
+        return value
+    try:
+        parsed = json.loads(str(value))
+        return parsed if isinstance(parsed, list) else []
+    except Exception:
+        return []
+
+
+def _settle_fold_status(
+    row: pd.Series,
+    results: pd.DataFrame,
+    resolve_team_fn,
+):
+    """
+    Return:
+    - 'Gewonnen' zodra alle legs gespeeld en gewonnen zijn;
+    - 'Verloren' zodra één gespeelde leg verloren is;
+    - 'Open' zolang minstens één leg nog niet gespeeld is.
+    """
+    legs = _load_fold_legs(row.get("FoldLegsJSON"))
+    if not legs:
+        return "Open"
+
+    any_pending = False
+
+    for leg in legs:
+        comp = str(leg.get("Competition", ""))
+        home_display = str(leg.get("HomeTeam", ""))
+        away_display = str(leg.get("AwayTeam", ""))
+        bet_name = str(leg.get("Bet", ""))
+
+        home = resolve_team_fn(
+            results, comp, home_display
+        )
+        away = resolve_team_fn(
+            results, comp, away_display
+        )
+
+        matches = results[
+            (results["Competition"] == comp)
+            & (results["HomeTeam"] == home)
+            & (results["AwayTeam"] == away)
+        ].copy()
+
+        date_raw = leg.get("Date")
+        if date_raw:
+            leg_date = pd.to_datetime(
+                date_raw, errors="coerce"
+            )
+            if pd.notna(leg_date):
+                same_date = matches[
+                    matches["Date"].dt.normalize()
+                    == pd.Timestamp(leg_date).normalize()
+                ]
+                if not same_date.empty:
+                    matches = same_date
+
+        if matches.empty:
+            any_pending = True
+            continue
+
+        result = matches.sort_values("Date").iloc[-1]
+        won = event_won(
+            bet_name,
+            home_display,
+            away_display,
+            int(result["FTHG"]),
+            int(result["FTAG"]),
+        )
+
+        if won is False:
+            return "Verloren"
+        if won is None:
+            any_pending = True
+
+    return "Open" if any_pending else "Gewonnen"
+
+def auto_settle_bets(
+    log: pd.DataFrame,
+    results: pd.DataFrame,
+    resolve_team_fn,
+) -> pd.DataFrame:
     out = normalise_bet_log(log)
     if out.empty or results.empty:
         return out
@@ -92,34 +206,70 @@ def auto_settle_bets(log: pd.DataFrame, results: pd.DataFrame, resolve_team_fn) 
     for idx, bet in out.iterrows():
         if bet["Status"] != "Open":
             continue
+
+        if str(bet.get("BetType", "Single")) == "Fold":
+            status = _settle_fold_status(
+                bet, results, resolve_team_fn
+            )
+            if status == "Open":
+                continue
+            ret, profit = settle_return(
+                status,
+                bet["Stake"],
+                bet["BookmakerOdd"],
+            )
+            out.at[idx, "Status"] = status
+            out.at[idx, "Return"] = ret
+            out.at[idx, "Profit"] = profit
+            continue
+
         comp = bet["Competition"]
-        home = resolve_team_fn(results, comp, bet["HomeTeam"])
-        away = resolve_team_fn(results, comp, bet["AwayTeam"])
+        home = resolve_team_fn(
+            results, comp, bet["HomeTeam"]
+        )
+        away = resolve_team_fn(
+            results, comp, bet["AwayTeam"]
+        )
+
         matches = results[
             (results["Competition"] == comp)
             & (results["HomeTeam"] == home)
             & (results["AwayTeam"] == away)
         ].copy()
+
         if pd.notna(bet["Date"]):
-            same_date = matches[matches["Date"].dt.normalize() == pd.Timestamp(bet["Date"]).normalize()]
+            same_date = matches[
+                matches["Date"].dt.normalize()
+                == pd.Timestamp(bet["Date"]).normalize()
+            ]
             if not same_date.empty:
                 matches = same_date
+
         if matches.empty:
             continue
-        r = matches.sort_values("Date").iloc[-1]
+
+        result = matches.sort_values("Date").iloc[-1]
         won = event_won(
-            bet["Bet"], str(bet["HomeTeam"]), str(bet["AwayTeam"]),
-            int(r["FTHG"]), int(r["FTAG"])
+            bet["Bet"],
+            str(bet["HomeTeam"]),
+            str(bet["AwayTeam"]),
+            int(result["FTHG"]),
+            int(result["FTAG"]),
         )
         if won is None:
             continue
+
         status = "Gewonnen" if won else "Verloren"
-        ret, profit = settle_return(status, bet["Stake"], bet["BookmakerOdd"])
+        ret, profit = settle_return(
+            status,
+            bet["Stake"],
+            bet["BookmakerOdd"],
+        )
         out.at[idx, "Status"] = status
         out.at[idx, "Return"] = ret
         out.at[idx, "Profit"] = profit
-    return out
 
+    return out
 
 def bankroll_timeline(
     log: pd.DataFrame,
@@ -182,21 +332,51 @@ def bankroll_timeline(
     return pd.DataFrame(rows)
 
 
-def current_bankroll_summary(log, start_bankroll, secure_pct, exposure_pct):
-    timeline = bankroll_timeline(log, start_bankroll, secure_pct, exposure_pct)
+def current_bankroll_summary(
+    log,
+    start_bankroll,
+    secure_pct,
+    exposure_pct,
+):
+    """
+    Conservatieve inzetruimte:
+    alle nog open singles en folds worden gezien als reeds vastgezet geld.
+    Zo kan een gebruiker niet per ongeluk dezelfde bankroll opnieuw inzetten
+    doordat open bets in verschillende ISO-weken staan.
+    """
+    normalised = recalculate_log(log)
+    timeline = bankroll_timeline(
+        normalised,
+        start_bankroll,
+        secure_pct,
+        exposure_pct,
+    )
     last = timeline.iloc[-1]
+
     active = float(last["ClosingBankroll"])
     secured = float(last["SecuredTotal"])
-    available = active * exposure_pct
-    if last["Status"] == "Open":
-        available = float(last["RemainingBudget"])
+
+    open_stake = float(
+        pd.to_numeric(
+            normalised.loc[
+                normalised["Status"] == "Open",
+                "Stake",
+            ],
+            errors="coerce",
+        ).fillna(0).sum()
+    )
+
+    gross_budget = active * exposure_pct
+    available = max(gross_budget - open_stake, 0.0)
+
     return {
         "active_bankroll": active,
         "secured_total": secured,
         "total_wealth": active + secured,
-        "available_to_stake": max(available, 0.0),
+        "open_stake": open_stake,
+        "gross_stake_budget": gross_budget,
+        "available_to_stake": available,
     }
-
 
 def max_drawdown(values: Iterable[float]) -> float:
     arr = np.asarray(list(values), dtype=float)
