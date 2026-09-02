@@ -13,17 +13,14 @@ from engine import (
     BacktestConfig,
     attach_toto_odds,
     build_backtest,
-    fetch_toto_week_odds,
     fetch_toto_week_odds_direct,
-    fetch_oddspapi_toto_board,
-    safe_fetch_oddspapi_toto_board,
-    oddspapi_account_status,
     fixture_bet_candidates,
     load_data,
     load_full_season_fixture_catalog,
-    most_likely_score,
     performance,
+    predict_fixture,
     resolve_catalog_team_name,
+    score_matrix,
     toto_week_result_for_match,
 )
 from tracker import (
@@ -51,6 +48,45 @@ def pct_nl(value, decimals=2):
     if pd.isna(value):
         return "–"
     return f"{float(value) * 100:.{decimals}f}%".replace(".", ",")
+
+
+
+def most_likely_score_local(
+    data,
+    competition,
+    fixture_date,
+    home_team,
+    away_team,
+    mode="Huidig seizoen",
+    n_matches=10,
+    pseudo=2,
+    max_goals=8,
+):
+    pred = predict_fixture(
+        data=data,
+        competition=competition,
+        fixture_date=fixture_date,
+        home_team=home_team,
+        away_team=away_team,
+        mode=mode,
+        n_matches=n_matches,
+        pseudo=pseudo,
+        max_goals=max_goals,
+    )
+    matrix = score_matrix(
+        float(pred["lambda_home"]),
+        float(pred["lambda_away"]),
+        max_goals,
+    )
+    flat_index = int(np.argmax(matrix))
+    home_goals, away_goals = np.unravel_index(flat_index, matrix.shape)
+    return {
+        "HomeGoals": int(home_goals),
+        "AwayGoals": int(away_goals),
+        "Probability": float(matrix[home_goals, away_goals]),
+        "lambda_home": float(pred["lambda_home"]),
+        "lambda_away": float(pred["lambda_away"]),
+    }
 
 
 def eur(value):
@@ -230,7 +266,7 @@ with tabs[0]:
                 kind="stable",
             ).reset_index(drop=True)
 
-        score_pred = most_likely_score(
+        score_pred = most_likely_score_local(
             data=results,
             competition=competition,
             fixture_date=fixture.Date,
