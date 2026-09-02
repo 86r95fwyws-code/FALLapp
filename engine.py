@@ -3386,3 +3386,264 @@ def safe_fetch_oddspapi_toto_board(api_key: str) -> dict:
             "_request_limit": account.get("_request_limit"),
             "_fixtures": [],
         }
+
+# =============================================================================
+# v1.0.4 — directe TOTO bron, zonder externe API
+# =============================================================================
+
+def _first_market_index(lines: list[str], exact_names) -> Optional[int]:
+    wanted = {_toto_norm(x) for x in exact_names}
+    for i, line in enumerate(lines):
+        if _toto_norm(line) in wanted:
+            return i
+    return None
+
+
+def _choice_odd_pairs(lines: list[str], start: int, stop: int):
+    """
+    Lees label -> eerstvolgende losse decimale odd. Houdt afstand klein zodat
+    odds uit een volgende markt niet per ongeluk worden gekoppeld.
+    """
+    pairs = []
+    i = start
+    while i < min(stop, len(lines)):
+        text = lines[i].strip()
+        if re.fullmatch(r"\d{1,3}[,.]\d{1,3}", text):
+            i += 1
+            continue
+        odd = _next_decimal(lines, i, 3)
+        if pd.notna(odd):
+            pairs.append((text, odd))
+        i += 1
+    return pairs
+
+
+def parse_toto_match_odds_direct(
+    html: str,
+    home_team: str,
+    away_team: str,
+) -> dict:
+    """
+    Rechtstreekse parser voor de publieke TOTO wedstrijdpagina.
+
+    Ondersteund:
+    - Resultaat / Resultaat - Vroege uitbetaling
+    - Dubbele Kans
+    - Beide Teams Scoren
+    - Aantal Goals - Over/Under 0.5 t/m 5.5
+
+    Alleen prijzen die daadwerkelijk in de HTML staan worden geretourneerd.
+    """
+    lines = _lines_from_html(html)
+    odds = {}
+
+    # --------------------------------------------------------------
+    # 1X2: vroege uitbetaling heeft voorkeur; anders gewone Resultaat.
+    # --------------------------------------------------------------
+    result_idx = None
+    for market_name in [
+        "Resultaat - Vroege uitbetaling",
+        "Resultaat",
+    ]:
+        idx = _first_market_index(lines, [market_name])
+        if idx is not None:
+            result_idx = idx
+            break
+
+    if result_idx is not None:
+        # Pak eerste 3 odds binnen een beperkt venster.
+        vals = []
+        for j in range(result_idx + 1, min(len(lines), result_idx + 16)):
+            raw = lines[j].strip()
+            if re.fullmatch(r"\d{1,3}[,.]\d{1,3}", raw):
+                val = _decimal(raw)
+                if pd.notna(val):
+                    vals.append(val)
+            if len(vals) >= 3:
+                break
+        if len(vals) >= 3:
+            odds["HOME"], odds["DRAW"], odds["AWAY"] = vals[:3]
+
+    # --------------------------------------------------------------
+    # Dubbele kans
+    # --------------------------------------------------------------
+    dc_idx = _first_market_index(lines, ["Dubbele Kans"])
+    if dc_idx is not None:
+        end_markers = {
+            "beide teams scoren",
+            "correct score",
+            "aantal goals over under",
+            "half time full time",
+            "handicap resultaat",
+        }
+        stop = min(len(lines), dc_idx + 28)
+        for j in range(dc_idx + 1, stop):
+            if j > dc_idx + 1 and _toto_norm(lines[j]) in end_markers:
+                stop = j
+                break
+
+        for label, odd in _choice_odd_pairs(lines, dc_idx + 1, stop):
+            norm = _toto_norm(label)
+            has_home = any(v in norm for v in _team_tokens(home_team))
+            has_away = any(v in norm for v in _team_tokens(away_team))
+            has_draw = "gelijkspel" in norm
+
+            if has_home and has_draw and not has_away:
+                odds["DC_1X"] = odd
+            elif has_away and has_draw and not has_home:
+                odds["DC_X2"] = odd
+            elif has_home and has_away and not has_draw:
+                odds["DC_12"] = odd
+
+    # --------------------------------------------------------------
+    # BTTS
+    # --------------------------------------------------------------
+    btts_idx = _first_market_index(lines, ["Beide Teams Scoren"])
+    if btts_idx is not None:
+        for j in range(btts_idx + 1, min(len(lines), btts_idx + 10)):
+            norm = _toto_norm(lines[j])
+            if norm == "ja":
+                val = _next_decimal(lines, j, 3)
+                if pd.notna(val):
+                    odds["BTTS_YES"] = val
+            elif norm == "nee":
+                val = _next_decimal(lines, j, 3)
+                if pd.notna(val):
+                    odds["BTTS_NO"] = val
+
+    # --------------------------------------------------------------
+    # Totaal goals 0.5 t/m 5.5
+    # --------------------------------------------------------------
+    total_idx = _first_market_index(lines, ["Aantal Goals - Over/Under"])
+    if total_idx is not None:
+        # Stop bij volgende bekende markt. Groot genoeg om 6 lijnen te bevatten.
+        stop_markers = {
+            "correct score",
+            "half time full time",
+            "handicap resultaat",
+            "draw no bet",
+            "speler scoort",
+            "beide teams scoren 2 of meer doelpunten",
+        }
+        stop = min(len(lines), total_idx + 48)
+        for j in range(total_idx + 1, stop):
+            if j > total_idx + 1 and _toto_norm(lines[j]) in stop_markers:
+                stop = j
+                break
+
+        line_re = re.compile(r"^(Over|Under)\s+([0-5][.,]5)$", re.I)
+        for j in range(total_idx + 1, stop):
+            m = line_re.fullmatch(lines[j].strip())
+            if not m:
+                continue
+            direction = m.group(1).upper()
+            line = float(m.group(2).replace(",", "."))
+            val = _next_decimal(lines, j, 3)
+            if pd.notna(val):
+                odds[f"TOTAL_{direction}_{line}"] = val
+
+    count = sum(
+        1 for k, v in odds.items()
+        if not k.startswith("_") and pd.notna(v)
+    )
+    odds["_status"] = f"{count} TOTO odds rechtstreeks gelezen"
+    odds["_provider"] = "TOTO direct"
+    return odds
+
+
+def fetch_toto_match_odds_direct(
+    url: str,
+    home_team: str,
+    away_team: str,
+    timeout: int = 10,
+) -> dict:
+    if not url:
+        return {
+            "_status": "Geen TOTO-wedstrijdlink gevonden",
+            "_url": None,
+            "_provider": "TOTO direct",
+        }
+    try:
+        html = _http_get(url, timeout=timeout)
+        odds = parse_toto_match_odds_direct(
+            html, home_team, away_team
+        )
+        odds["_url"] = url
+        return odds
+    except Exception as exc:
+        return {
+            "_status": f"TOTO-pagina niet bereikbaar ({type(exc).__name__})",
+            "_url": url,
+            "_provider": "TOTO direct",
+        }
+
+
+def fetch_toto_week_odds_direct(
+    competition: str,
+    matches,
+    timeout: int = 10,
+    max_workers: int = 6,
+) -> dict:
+    """
+    Rechtstreeks TOTO laden:
+    1. competitiepagina één keer;
+    2. wedstrijdlinks lokaal koppelen;
+    3. wedstrijdpagina's parallel ophalen;
+    4. géén externe odds-API.
+    """
+    pairs = [(str(h), str(a)) for h, a in matches]
+    index = fetch_toto_competition_index(
+        competition, timeout=timeout
+    )
+
+    results = {
+        "_status": index.get("_status", ""),
+        "_source": index.get("_source"),
+        "_provider": "TOTO direct",
+        "_matches_requested": len(pairs),
+        "_matches_linked": 0,
+    }
+
+    jobs = []
+    for home, away in pairs:
+        url = _find_url_in_index(index, home, away)
+        if not url:
+            url = find_toto_match_url(
+                competition,
+                home,
+                away,
+                timeout=timeout,
+            )
+        if url:
+            results["_matches_linked"] += 1
+        jobs.append((home, away, url))
+
+    def worker(job):
+        home, away, url = job
+        return (
+            _toto_match_cache_key(home, away),
+            fetch_toto_match_odds_direct(
+                url, home, away, timeout=timeout
+            ),
+        )
+
+    workers = max(1, min(int(max_workers), len(jobs) or 1))
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [executor.submit(worker, job) for job in jobs]
+        for future in as_completed(futures):
+            try:
+                key, value = future.result()
+                results[key] = value
+            except Exception:
+                continue
+
+    found = 0
+    for key, value in results.items():
+        if key.startswith("_") or not isinstance(value, dict):
+            continue
+        found += sum(
+            1 for k, v in value.items()
+            if not k.startswith("_") and pd.notna(v)
+        )
+    results["_odds_found"] = found
+    return results
