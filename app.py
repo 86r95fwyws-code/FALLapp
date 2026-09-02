@@ -18,7 +18,6 @@ from engine import (
     fixture_bet_candidates,
     load_data,
     load_full_season_fixture_catalog,
-    next_pending_round,
     performance,
     predict_fixture,
     resolve_catalog_team_name,
@@ -96,6 +95,159 @@ def eur(value):
         return "–"
     return f"€{float(value):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
+
+def next_pending_round_local(
+    schedule,
+    results,
+    competition,
+    reference_date=None,
+):
+    """
+    Kies automatisch de eerstvolgende nog niet afgeronde speelronde.
+    Staat bewust lokaal in app.py zodat de app niet crasht wanneer Streamlit
+    tijdelijk nog een vorige engine.py gebruikt.
+    """
+    comp_schedule = schedule[
+        schedule["Competition"] == competition
+    ].copy()
+
+    if comp_schedule.empty:
+        return 1
+
+    comp_schedule["Round"] = pd.to_numeric(
+        comp_schedule["Round"],
+        errors="coerce",
+    )
+    comp_schedule["Date"] = pd.to_datetime(
+        comp_schedule["Date"],
+        errors="coerce",
+    ).dt.normalize()
+
+    comp_schedule = comp_schedule[
+        comp_schedule["Round"].notna()
+        & comp_schedule["Date"].notna()
+    ].copy()
+
+    if comp_schedule.empty:
+        return 1
+
+    rounds = sorted(
+        comp_schedule["Round"]
+        .astype(int)
+        .unique()
+        .tolist()
+    )
+
+    today = (
+        pd.Timestamp(reference_date).normalize()
+        if reference_date is not None
+        else pd.Timestamp.now().normalize()
+    )
+
+    comp_results = results[
+        results["Competition"] == competition
+    ].copy()
+
+    if not comp_results.empty:
+        comp_results["Date"] = pd.to_datetime(
+            comp_results["Date"],
+            errors="coerce",
+        ).dt.normalize()
+
+    played = set()
+
+    for row in comp_results.itertuples():
+        try:
+            home = resolve_catalog_team_name(
+                results,
+                competition,
+                str(row.HomeTeam),
+            )
+            away = resolve_catalog_team_name(
+                results,
+                competition,
+                str(row.AwayTeam),
+            )
+            played.add((
+                home,
+                away,
+                pd.Timestamp(row.Date).normalize(),
+            ))
+        except Exception:
+            continue
+
+    future_candidates = []
+    old_incomplete = []
+
+    for round_number in rounds:
+        group = comp_schedule[
+            comp_schedule["Round"].astype(int)
+            == int(round_number)
+        ].copy()
+
+        pending_dates = []
+
+        for row in group.itertuples():
+            home = resolve_catalog_team_name(
+                results,
+                competition,
+                str(row.HomeTeam),
+            )
+            away = resolve_catalog_team_name(
+                results,
+                competition,
+                str(row.AwayTeam),
+            )
+
+            match_key = (
+                home,
+                away,
+                pd.Timestamp(row.Date).normalize(),
+            )
+
+            if match_key not in played:
+                pending_dates.append(
+                    pd.Timestamp(row.Date).normalize()
+                )
+
+        if not pending_dates:
+            continue
+
+        pending_dates = pd.Series(pending_dates)
+        relevant = pending_dates[
+            pending_dates
+            >= today - pd.Timedelta(days=1)
+        ]
+
+        if len(relevant):
+            future_candidates.append((
+                relevant.min(),
+                int(round_number),
+            ))
+        else:
+            old_incomplete.append(
+                int(round_number)
+            )
+
+    if future_candidates:
+        future_candidates.sort(
+            key=lambda item: (
+                item[0],
+                item[1],
+            )
+        )
+        return int(
+            future_candidates[0][1]
+        )
+
+    if old_incomplete:
+        return int(
+            min(old_incomplete)
+        )
+
+    return int(
+        rounds[-1]
+    )
 
 @st.cache_data(ttl=900, show_spinner=False)
 def cached_results():
@@ -189,7 +341,7 @@ with tabs[0]:
         comp_schedule["Round"].dropna().astype(int).unique().tolist()
     )
 
-    default_round = next_pending_round(
+    default_round = next_pending_round_local(
         schedule,
         results,
         competition,
@@ -511,7 +663,7 @@ with tabs[1]:
         bet_rounds = sorted(
             bs["Round"].dropna().astype(int).unique().tolist()
         )
-        default_bet_round = next_pending_round(
+        default_bet_round = next_pending_round_local(
             schedule,
             results,
             bet_comp,
@@ -746,7 +898,7 @@ with tabs[1]:
         fold_rounds = sorted(
             fs["Round"].dropna().astype(int).unique().tolist()
         )
-        default_fold_round = next_pending_round(
+        default_fold_round = next_pending_round_local(
             schedule,
             results,
             fold_comp,
