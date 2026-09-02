@@ -21,6 +21,7 @@ from engine import (
     fixture_bet_candidates,
     load_data,
     load_full_season_fixture_catalog,
+    most_likely_score,
     performance,
     resolve_catalog_team_name,
     toto_week_result_for_match,
@@ -194,6 +195,7 @@ with tabs[0]:
         toto_week = cached_toto_week(competition, pairs)
 
     results_by_match = {}
+    score_predictions = {}
     all_bets = []
     summaries = []
 
@@ -219,7 +221,28 @@ with tabs[0]:
                 & cands["ValuePct"].notna()
                 & (cands["ValuePct"] >= min_value)
             ].copy()
+
+        # Gebruikersvoorkeur: laagste kwalificerende kans bovenaan.
+        if not cands.empty:
+            cands = cands.sort_values(
+                ["ModelProb", "Category", "Bet"],
+                ascending=[True, True, True],
+                kind="stable",
+            ).reset_index(drop=True)
+
+        score_pred = most_likely_score(
+            data=results,
+            competition=competition,
+            fixture_date=fixture.Date,
+            home_team=fixture.HomeTeam,
+            away_team=fixture.AwayTeam,
+            mode="Huidig seizoen",
+            pseudo=pseudo,
+            max_goals=8,
+        )
+
         results_by_match[fixture.Match] = cands
+        score_predictions[fixture.Match] = score_pred
         all_bets.append(cands)
         summaries.append({"Match": fixture.Match, "Bets": len(cands)})
 
@@ -234,6 +257,26 @@ with tabs[0]:
         "Alleen daadwerkelijk gevonden prijzen worden getoond."
     )
 
+    team_market_matches = 0
+    for fixture in round_df.itertuples():
+        toto_info = toto_week_result_for_match(
+            toto_week, fixture.HomeTeam, fixture.AwayTeam
+        )
+        if int(toto_info.get("_team_totals_found", 0) or 0) > 0:
+            team_market_matches += 1
+
+    if team_market_matches:
+        st.success(
+            f"Teamgoal TOTO-markten gevonden bij {team_market_matches}/"
+            f"{len(round_df)} wedstrijden."
+        )
+    else:
+        st.info(
+            "Voor deze speelronde levert de publieke TOTO-wedstrijdpagina geen "
+            "aparte teamgoal Over/Under-markten aan. Het model berekent ze wel, "
+            "maar ik vul daarvoor geen geschatte TOTO-odd in."
+        )
+
     for fixture in round_df.itertuples():
         cands = results_by_match[fixture.Match]
         title = (
@@ -241,6 +284,32 @@ with tabs[0]:
             f"{len(cands)} {'bet' if len(cands)==1 else 'bets'}"
         )
         with st.expander(title, expanded=len(cands) > 0):
+            score_pred = score_predictions.get(fixture.Match)
+            if score_pred:
+                st.caption("Meest waarschijnlijke exacte uitslag")
+                sc1, sc2 = st.columns([3, 1])
+                sc1.markdown(
+                    f"### {fixture.HomeTeam} "
+                    f"{score_pred['HomeGoals']} – {score_pred['AwayGoals']} "
+                    f"{fixture.AwayTeam}"
+                )
+                sc2.metric(
+                    "Kans",
+                    pct_nl(score_pred["Probability"]),
+                )
+                st.progress(
+                    min(max(float(score_pred["Probability"]), 0.0), 1.0),
+                    text=(
+                        f"Exacte scorekans: "
+                        f"{pct_nl(score_pred['Probability'])}"
+                    ),
+                )
+                st.caption(
+                    f"Verwachte goals: "
+                    f"{score_pred['lambda_home']:.2f} – "
+                    f"{score_pred['lambda_away']:.2f}"
+                )
+
             if cands.empty:
                 st.caption("Geen bets voldoen aan de ingestelde filters.")
             else:
@@ -262,9 +331,59 @@ with tabs[0]:
                     },
                 )
 
+                missing_team = cands[
+                    cands["Category"].isin(
+                        ["Teamgoals thuis", "Teamgoals uit"]
+                    )
+                    & cands["TotoOdd"].isna()
+                ].copy()
+
+                if not missing_team.empty:
+                    with st.expander(
+                        "Teamgoal TOTO-odds handmatig aanvullen",
+                        expanded=False,
+                    ):
+                        st.caption(
+                            "Gebruik dit alleen wanneer je de exacte TOTO-odd zelf "
+                            "in TOTO ziet. De app verzint hier geen bookmakerprijs."
+                        )
+                        manual_view = missing_team[
+                            ["Bet", "ModelProb", "FairOdd"]
+                        ].copy()
+                        manual_view["Kans"] = manual_view["ModelProb"].apply(
+                            pct_nl
+                        )
+                        manual_view["TOTO odd"] = 0.0
+                        manual_view = manual_view[
+                            ["Bet", "Kans", "FairOdd", "TOTO odd"]
+                        ]
+                        st.data_editor(
+                            manual_view,
+                            use_container_width=True,
+                            hide_index=True,
+                            disabled=["Bet", "Kans", "FairOdd"],
+                            key=f"team_toto_manual_{competition}_{selected_round}_{fixture.Match}",
+                            column_config={
+                                "FairOdd": st.column_config.NumberColumn(
+                                    "Fair odd", format="%.2f"
+                                ),
+                                "TOTO odd": st.column_config.NumberColumn(
+                                    "TOTO odd",
+                                    min_value=0.0,
+                                    step=0.01,
+                                    format="%.2f",
+                                ),
+                            },
+                        )
+
     nonempty = [x for x in all_bets if not x.empty]
     if nonempty:
         combined = pd.concat(nonempty, ignore_index=True)
+        combined = combined.sort_values(
+            ["ModelProb", "Match", "Category", "Bet"],
+            ascending=[True, True, True, True],
+            kind="stable",
+        ).reset_index(drop=True)
         st.divider()
         st.markdown("#### Alle geselecteerde bets van deze ronde")
         d = combined[["Match", "Category", "Bet", "ModelProb", "FairOdd", "TotoOdd", "ValuePct"]].copy()

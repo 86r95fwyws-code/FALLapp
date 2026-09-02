@@ -501,6 +501,68 @@ def predict_fixture(
 
 
 
+
+def most_likely_score(
+    data: pd.DataFrame,
+    competition: str,
+    fixture_date,
+    home_team: str,
+    away_team: str,
+    mode: str = "Huidig seizoen",
+    n_matches: int = 10,
+    pseudo: int = 2,
+    max_goals: int = 8,
+) -> dict:
+    """
+    Geef de exacte score met de hoogste Poisson-kans.
+    Gebruikt exact dezelfde lambda's als predict_fixture / fixture_bet_candidates.
+    """
+    pred = predict_fixture(
+        data=data,
+        competition=competition,
+        fixture_date=fixture_date,
+        home_team=home_team,
+        away_team=away_team,
+        mode=mode,
+        n_matches=n_matches,
+        pseudo=pseudo,
+        max_goals=max_goals,
+    )
+
+    matrix = score_matrix(
+        float(pred["lambda_home"]),
+        float(pred["lambda_away"]),
+        max_goals,
+    )
+
+    flat_index = int(np.argmax(matrix))
+    home_goals, away_goals = np.unravel_index(
+        flat_index, matrix.shape
+    )
+    probability = float(matrix[home_goals, away_goals])
+
+    # Ook top-3 opslaan voor later uitbreiden zonder nieuwe berekening.
+    flat_order = np.argsort(matrix, axis=None)[::-1][:3]
+    top3 = []
+    for idx in flat_order:
+        hg, ag = np.unravel_index(int(idx), matrix.shape)
+        top3.append({
+            "HomeGoals": int(hg),
+            "AwayGoals": int(ag),
+            "Probability": float(matrix[hg, ag]),
+        })
+
+    return {
+        "HomeTeam": home_team,
+        "AwayTeam": away_team,
+        "HomeGoals": int(home_goals),
+        "AwayGoals": int(away_goals),
+        "Probability": probability,
+        "lambda_home": float(pred["lambda_home"]),
+        "lambda_away": float(pred["lambda_away"]),
+        "Top3": top3,
+    }
+
 def _numeric(row: pd.Series, names: list[str]) -> float:
     for name in names:
         if name in row.index:
@@ -2415,6 +2477,9 @@ def attach_toto_odds(candidates: pd.DataFrame, toto_odds: dict) -> pd.DataFrame:
     )
     out["TotoURL"] = toto_odds.get("_url")
     out["TotoStatus"] = toto_odds.get("_status", "")
+    out["TotoTeamTotalsFound"] = int(
+        toto_odds.get("_team_totals_found", 0) or 0
+    )
     return out
 
 # =============================================================================
@@ -3418,6 +3483,126 @@ def _choice_odd_pairs(lines: list[str], start: int, stop: int):
     return pairs
 
 
+def _line_from_team_market_header(header: str):
+    """Lees trailing lijn uit bv. 'Ajax Aantal Goals - Over/Under 1.5'."""
+    normalized = str(header).strip().replace(",", ".")
+    m = re.search(r"([0-5]\.5)\s*$", normalized)
+    return float(m.group(1)) if m else np.nan
+
+
+def _team_name_matches_header(header: str, team: str) -> bool:
+    norm = _toto_norm(header)
+    team_variants = _team_tokens(team)
+    return any(v and v in norm for v in team_variants)
+
+
+def _is_team_total_header(header: str, team: str) -> bool:
+    """
+    TOTO gebruikt o.a.:
+      'Team Aantal Goals - Over/Under'
+      'Team Aantal Goals - Over/Under 1.5'
+      'Team Aantal Goals - Over/Under (Excl. OT) 1.5'
+    """
+    norm = _toto_norm(header)
+    if not _team_name_matches_header(header, team):
+        return False
+
+    required = (
+        "aantal goals over under" in norm
+        or "team goals over under" in norm
+        or "team total goals" in norm
+    )
+    return required
+
+
+def _is_new_market_header(line: str) -> bool:
+    norm = _toto_norm(line)
+    markers = (
+        "resultaat",
+        "dubbele kans",
+        "beide teams scoren",
+        "correct score",
+        "half time full time",
+        "handicap resultaat",
+        "draw no bet",
+        "speler scoort",
+        "team to score",
+        "aantal goals over under",
+        "team goals over under",
+        "team total goals",
+    )
+    return any(marker in norm for marker in markers)
+
+
+def parse_toto_team_totals(
+    lines: list[str],
+    home_team: str,
+    away_team: str,
+) -> dict:
+    """
+    Parse team Over/Under-markten uit TOTO HTML wanneer die werkelijk aanwezig zijn.
+
+    Ondersteunt twee echte TOTO-structuren:
+    A) 'Ajax Aantal Goals - Over/Under'
+       'Over 0.5' -> odd
+       'Under 0.5' -> odd
+
+    B) 'Ajax Aantal Goals - Over/Under 1.5'
+       'Over' -> odd
+       'Under' -> odd
+    """
+    odds = {}
+
+    for side, team in (("HOME", home_team), ("AWAY", away_team)):
+        for idx, header in enumerate(lines):
+            if not _is_team_total_header(header, team):
+                continue
+
+            header_line = _line_from_team_market_header(header)
+
+            # Stop zodra een volgende duidelijke markt begint.
+            stop = min(len(lines), idx + 44)
+            for j in range(idx + 1, stop):
+                if j > idx + 1 and _is_new_market_header(lines[j]):
+                    # Een gewone 'Over x.5' of 'Under x.5' is geen header.
+                    if not re.fullmatch(
+                        r"(Over|Under)\s+[0-5][.,]5",
+                        lines[j].strip(),
+                        re.I,
+                    ):
+                        stop = j
+                        break
+
+            # Structuur B: lijn staat in de header, daarna losse Over / Under.
+            if pd.notna(header_line):
+                for j in range(idx + 1, stop):
+                    token = _toto_norm(lines[j])
+                    if token in ("over", "o"):
+                        val = _next_decimal(lines, j, 3)
+                        if pd.notna(val):
+                            odds[f"TEAM_{side}_OVER_{header_line}"] = val
+                    elif token in ("under", "u"):
+                        val = _next_decimal(lines, j, 3)
+                        if pd.notna(val):
+                            odds[f"TEAM_{side}_UNDER_{header_line}"] = val
+
+            # Structuur A: lijn staat bij de keuze zelf.
+            line_re = re.compile(
+                r"^(Over|Under)\s+([0-5][.,]5)$",
+                re.I,
+            )
+            for j in range(idx + 1, stop):
+                m = line_re.fullmatch(lines[j].strip())
+                if not m:
+                    continue
+                direction = m.group(1).upper()
+                line = float(m.group(2).replace(",", "."))
+                val = _next_decimal(lines, j, 3)
+                if pd.notna(val):
+                    odds[f"TEAM_{side}_{direction}_{line}"] = val
+
+    return odds
+
 def parse_toto_match_odds_direct(
     html: str,
     home_team: str,
@@ -3431,6 +3616,8 @@ def parse_toto_match_odds_direct(
     - Dubbele Kans
     - Beide Teams Scoren
     - Aantal Goals - Over/Under 0.5 t/m 5.5
+    - Team Aantal Goals - Over/Under 0.5 t/m 5.5, ALS TOTO deze markt
+      daadwerkelijk in de publieke wedstrijdpagina meestuurt.
 
     Alleen prijzen die daadwerkelijk in de HTML staan worden geretourneerd.
     """
@@ -3541,6 +3728,17 @@ def parse_toto_match_odds_direct(
             val = _next_decimal(lines, j, 3)
             if pd.notna(val):
                 odds[f"TOTAL_{direction}_{line}"] = val
+
+    # --------------------------------------------------------------
+    # Teamgoals thuis/uit — alleen als TOTO ze echt publiceert.
+    # --------------------------------------------------------------
+    team_odds = parse_toto_team_totals(
+        lines,
+        home_team,
+        away_team,
+    )
+    odds.update(team_odds)
+    odds["_team_totals_found"] = int(len(team_odds))
 
     count = sum(
         1 for k, v in odds.items()
