@@ -3168,14 +3168,31 @@ def fetch_toto_week_odds(
     """
     if api_key:
         try:
-            board = api_board or fetch_oddspapi_toto_board(api_key)
+            board = api_board if api_board is not None else safe_fetch_oddspapi_toto_board(api_key)
+
+            if isinstance(board, dict) and board.get("_ok") is False:
+                fallback = _fetch_toto_week_odds_website(
+                    competition,
+                    matches,
+                    timeout=timeout,
+                    max_workers=max_workers,
+                )
+                fallback["_provider"] = "website-fallback"
+                fallback["_structured_error"] = board.get("_error_code") or "STRUCTURED_UNAVAILABLE"
+                fallback["_structured_status"] = board.get(
+                    "_status", "Complete TOTO odds-feed niet beschikbaar"
+                )
+                return fallback
+
             structured = oddspapi_board_for_matches(
                 board, competition, matches, api_key
             )
             structured["_provider"] = "structured"
+            structured["_structured_status"] = board.get("_status", "")
             return structured
+
         except Exception as exc:
-            # Alleen als structured feed volledig faalt gebruiken we website.
+            # Een fout in de externe feed mag de Streamlit-app nooit laten crashen.
             fallback = _fetch_toto_week_odds_website(
                 competition,
                 matches,
@@ -3184,6 +3201,9 @@ def fetch_toto_week_odds(
             )
             fallback["_provider"] = "website-fallback"
             fallback["_structured_error"] = type(exc).__name__
+            fallback["_structured_status"] = (
+                f"Complete odds-feed fout ({type(exc).__name__}); website-fallback actief"
+            )
             return fallback
 
     direct = _fetch_toto_week_odds_website(
@@ -3194,3 +3214,175 @@ def fetch_toto_week_odds(
     )
     direct["_provider"] = "website"
     return direct
+
+# =============================================================================
+# v1.0.3 — fail-safe OddsPapi integratie
+# =============================================================================
+
+def oddspapi_account_status(api_key: str) -> dict:
+    """
+    Controleer de API-key via /account.
+    Volgens OddsPapi is /account unmetered en blijft dit endpoint beschikbaar
+    wanneer de normale maandquota al is bereikt.
+    """
+    if not api_key:
+        return {
+            "_ok": False,
+            "_status": "Geen API key ingesteld",
+            "_error_code": "NO_KEY",
+        }
+
+    url = f"{ODDSPAPI_BASE}/account"
+    try:
+        response = requests.get(
+            url,
+            params={"apiKey": api_key},
+            timeout=20,
+        )
+
+        if response.status_code in (401, 403):
+            return {
+                "_ok": False,
+                "_status": "OddsPapi API key is ongeldig of heeft geen toegang",
+                "_error_code": "AUTH",
+                "_http_status": response.status_code,
+            }
+
+        if response.status_code != 200:
+            message = ""
+            code = f"HTTP_{response.status_code}"
+            try:
+                body = response.json()
+                message = (
+                    body.get("message")
+                    or body.get("details")
+                    or body.get("error", {}).get("message")
+                    or ""
+                )
+                code = body.get("code") or body.get("error", {}).get("code") or code
+            except Exception:
+                pass
+            return {
+                "_ok": False,
+                "_status": f"OddsPapi accountcontrole mislukt ({code})"
+                + (f": {message}" if message else ""),
+                "_error_code": code,
+                "_http_status": response.status_code,
+            }
+
+        account = response.json() or {}
+        subscriptions = account.get("subscriptions") or []
+        active = [s for s in subscriptions if s.get("is_active") is True]
+        subscription = active[0] if active else (subscriptions[0] if subscriptions else {})
+
+        request_limit = pd.to_numeric(
+            pd.Series([subscription.get("request_limit")]),
+            errors="coerce",
+        ).iloc[0]
+        request_count = pd.to_numeric(
+            pd.Series([subscription.get("request_count")]),
+            errors="coerce",
+        ).iloc[0]
+
+        quota_exhausted = (
+            pd.notna(request_limit)
+            and pd.notna(request_count)
+            and float(request_count) >= float(request_limit)
+        )
+
+        sport_ids = subscription.get("sport_ids") or []
+        soccer_allowed = not sport_ids or 10 in sport_ids or "10" in sport_ids
+
+        bookmakers = subscription.get("bookmakers") or {}
+        # Een lege bookmakers-map behandelen we als "niet expliciet beperkt".
+        toto_explicitly_missing = bool(bookmakers) and "toto.nl" not in bookmakers
+
+        if quota_exhausted:
+            return {
+                "_ok": False,
+                "_status": (
+                    f"OddsPapi maandlimiet bereikt: "
+                    f"{int(request_count)}/{int(request_limit)} requests"
+                ),
+                "_error_code": "REQUEST_LIMIT_EXCEEDED",
+                "_request_count": int(request_count),
+                "_request_limit": int(request_limit),
+                "_quota_exhausted": True,
+                "_account": account,
+            }
+
+        if not soccer_allowed:
+            return {
+                "_ok": False,
+                "_status": "Je OddsPapi-abonnement bevat geen voetbal (sportId 10)",
+                "_error_code": "SOCCER_NOT_INCLUDED",
+                "_request_count": int(request_count) if pd.notna(request_count) else None,
+                "_request_limit": int(request_limit) if pd.notna(request_limit) else None,
+                "_account": account,
+            }
+
+        status = "OddsPapi API key geldig"
+        if pd.notna(request_count) and pd.notna(request_limit):
+            status += f" · {int(request_count)}/{int(request_limit)} requests gebruikt"
+
+        if toto_explicitly_missing:
+            status += " · TOTO NL staat niet expliciet in je abonnementsboekmakers"
+
+        return {
+            "_ok": True,
+            "_status": status,
+            "_error_code": None,
+            "_request_count": int(request_count) if pd.notna(request_count) else None,
+            "_request_limit": int(request_limit) if pd.notna(request_limit) else None,
+            "_quota_exhausted": False,
+            "_toto_explicitly_missing": toto_explicitly_missing,
+            "_account": account,
+        }
+
+    except Exception as exc:
+        return {
+            "_ok": False,
+            "_status": (
+                "OddsPapi accountcontrole kon geen verbinding maken "
+                f"({type(exc).__name__})"
+            ),
+            "_error_code": "CONNECTION",
+        }
+
+
+def safe_fetch_oddspapi_toto_board(api_key: str) -> dict:
+    """
+    Nooit een exception naar Streamlit laten ontsnappen.
+    Geeft bij een externe API-fout een statusobject terug zodat de app daarna
+    automatisch de publieke TOTO-site kan gebruiken.
+    """
+    account = oddspapi_account_status(api_key)
+
+    if not account.get("_ok"):
+        return {
+            "_ok": False,
+            "_status": account.get("_status", "OddsPapi niet beschikbaar"),
+            "_error_code": account.get("_error_code"),
+            "_request_count": account.get("_request_count"),
+            "_request_limit": account.get("_request_limit"),
+            "_fixtures": [],
+        }
+
+    try:
+        board = fetch_oddspapi_toto_board(api_key)
+        board = dict(board or {})
+        board["_ok"] = True
+        board["_account_status"] = account.get("_status")
+        return board
+    except Exception as exc:
+        return {
+            "_ok": False,
+            "_status": (
+                "Complete TOTO odds-feed is tijdelijk niet beschikbaar "
+                f"({type(exc).__name__}); website-fallback wordt gebruikt"
+            ),
+            "_error_code": type(exc).__name__,
+            "_request_count": account.get("_request_count"),
+            "_request_limit": account.get("_request_limit"),
+            "_fixtures": [],
+        }

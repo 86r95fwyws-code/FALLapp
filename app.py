@@ -15,6 +15,8 @@ from engine import (
     build_backtest,
     fetch_toto_week_odds,
     fetch_oddspapi_toto_board,
+    safe_fetch_oddspapi_toto_board,
+    oddspapi_account_status,
     fixture_bet_candidates,
     load_data,
     load_full_season_fixture_catalog,
@@ -73,10 +75,16 @@ def cached_schedule():
     return load_full_season_fixture_catalog(ALL_COMPETITIONS)
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def cached_oddspapi_account(api_key):
+    # /account is volgens OddsPapi unmetered en geschikt voor quota/key checks.
+    return oddspapi_account_status(api_key)
+
+
 @st.cache_data(ttl=1800, show_spinner=False)
 def cached_oddspapi_board(api_key):
-    # Eén request levert de TOTO odds voor alle zes competities.
-    return fetch_oddspapi_toto_board(api_key)
+    # Nooit exception naar Streamlit: safe wrapper retourneert altijd een dict.
+    return safe_fetch_oddspapi_toto_board(api_key)
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
@@ -100,6 +108,7 @@ if rc1.button("↻ Data", use_container_width=True):
 if rc2.button("↻ TOTO", use_container_width=True):
     cached_toto_week.clear()
     cached_oddspapi_board.clear()
+    cached_oddspapi_account.clear()
     st.rerun()
 
 with st.spinner("Actuele 2026/27-data laden..."):
@@ -116,28 +125,42 @@ if schedule.empty:
 # Globale instellingen
 st.sidebar.markdown("### TOTO odds")
 toto_api_key = get_toto_api_key()
+
 if toto_api_key:
-    st.sidebar.success("Complete TOTO odds-feed actief")
+    api_account = cached_oddspapi_account(toto_api_key)
+    if api_account.get("_ok"):
+        st.sidebar.success(api_account.get("_status", "OddsPapi API key geldig"))
+        st.sidebar.caption(
+            "De app probeert de complete TOTO-feed. Als die niet reageert, "
+            "wordt automatisch de publieke TOTO-site gebruikt."
+        )
+    else:
+        st.sidebar.warning(api_account.get("_status", "OddsPapi niet beschikbaar"))
+        st.sidebar.caption(
+            "De app blijft werken via de publieke TOTO-site; er verschijnt geen rood foutscherm."
+        )
 else:
     st.sidebar.warning(
         "Website-fallback actief: alleen markten die TOTO direct in de publieke pagina laadt."
     )
-    with st.sidebar.expander("Complete TOTO odds activeren"):
-        st.caption(
-            "Vul hier tijdelijk je gratis OddsPapi API key in, of zet hem permanent "
-            "in Streamlit Secrets als ODDSPAPI_KEY."
-        )
-        manual_key = st.text_input(
-            "OddsPapi API key",
-            type="password",
-            value=st.session_state.get("manual_oddspapi_key", ""),
-            key="oddspapi_key_input",
-        )
-        if st.button("API key gebruiken", key="save_oddspapi_key"):
-            st.session_state.manual_oddspapi_key = manual_key.strip()
-            cached_toto_week.clear()
-            cached_oddspapi_board.clear()
-            st.rerun()
+
+with st.sidebar.expander("TOTO API-instellingen"):
+    st.caption(
+        "Je Streamlit Secret ODDSPAPI_KEY heeft voorrang. "
+        "Een handmatige key hieronder geldt alleen voor deze sessie."
+    )
+    manual_key = st.text_input(
+        "OddsPapi API key",
+        type="password",
+        value=st.session_state.get("manual_oddspapi_key", ""),
+        key="oddspapi_key_input",
+    )
+    if st.button("API key gebruiken", key="save_oddspapi_key"):
+        st.session_state.manual_oddspapi_key = manual_key.strip()
+        cached_toto_week.clear()
+        cached_oddspapi_board.clear()
+        cached_oddspapi_account.clear()
+        st.rerun()
 
 st.sidebar.markdown("### Model")
 pseudo = st.sidebar.select_slider(
@@ -269,9 +292,14 @@ with tabs[0]:
             "die markt op dit moment niet aanbiedt in de feed."
         )
     elif provider == "website-fallback":
+        structured_status = toto_week.get(
+            "_structured_status",
+            "De complete TOTO-feed kon niet worden gebruikt.",
+        )
         st.warning(
-            "De structured feed kon niet worden gebruikt; de app is teruggevallen op de "
-            "publieke TOTO-pagina. Extra markten achter 'Bekijk meer' kunnen daardoor ontbreken."
+            f"{structured_status} "
+            "De app gebruikt nu automatisch de publieke TOTO-pagina. "
+            "Extra markten achter 'Bekijk meer' kunnen daardoor ontbreken."
         )
     else:
         st.caption(
