@@ -14,6 +14,7 @@ from engine import (
     attach_toto_odds,
     build_backtest,
     fetch_toto_week_odds,
+    fetch_oddspapi_toto_board,
     fixture_bet_candidates,
     load_data,
     load_full_season_fixture_catalog,
@@ -54,6 +55,14 @@ def eur(value):
     return f"€{float(value):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
 
+def get_toto_api_key():
+    """Streamlit Secret heeft voorkeur; handmatige sessie-key is fallback."""
+    try:
+        secret_key = st.secrets.get("ODDSPAPI_KEY", "")
+    except Exception:
+        secret_key = ""
+    return str(secret_key or st.session_state.get("manual_oddspapi_key", "")).strip()
+
 @st.cache_data(ttl=900, show_spinner=False)
 def cached_results():
     return load_data(ALL_COMPETITIONS, [SEASON])
@@ -64,9 +73,23 @@ def cached_schedule():
     return load_full_season_fixture_catalog(ALL_COMPETITIONS)
 
 
-@st.cache_data(ttl=300, show_spinner=False)
-def cached_toto_week(competition, matches):
-    return fetch_toto_week_odds(competition, matches, timeout=9, max_workers=6)
+@st.cache_data(ttl=1800, show_spinner=False)
+def cached_oddspapi_board(api_key):
+    # Eén request levert de TOTO odds voor alle zes competities.
+    return fetch_oddspapi_toto_board(api_key)
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def cached_toto_week(competition, matches, api_key=""):
+    board = cached_oddspapi_board(api_key) if api_key else None
+    return fetch_toto_week_odds(
+        competition,
+        matches,
+        timeout=9,
+        max_workers=6,
+        api_key=api_key or None,
+        api_board=board,
+    )
 
 
 # Data verversen
@@ -76,6 +99,7 @@ if rc1.button("↻ Data", use_container_width=True):
     st.rerun()
 if rc2.button("↻ TOTO", use_container_width=True):
     cached_toto_week.clear()
+    cached_oddspapi_board.clear()
     st.rerun()
 
 with st.spinner("Actuele 2026/27-data laden..."):
@@ -90,6 +114,31 @@ if schedule.empty:
     st.stop()
 
 # Globale instellingen
+st.sidebar.markdown("### TOTO odds")
+toto_api_key = get_toto_api_key()
+if toto_api_key:
+    st.sidebar.success("Complete TOTO odds-feed actief")
+else:
+    st.sidebar.warning(
+        "Website-fallback actief: alleen markten die TOTO direct in de publieke pagina laadt."
+    )
+    with st.sidebar.expander("Complete TOTO odds activeren"):
+        st.caption(
+            "Vul hier tijdelijk je gratis OddsPapi API key in, of zet hem permanent "
+            "in Streamlit Secrets als ODDSPAPI_KEY."
+        )
+        manual_key = st.text_input(
+            "OddsPapi API key",
+            type="password",
+            value=st.session_state.get("manual_oddspapi_key", ""),
+            key="oddspapi_key_input",
+        )
+        if st.button("API key gebruiken", key="save_oddspapi_key"):
+            st.session_state.manual_oddspapi_key = manual_key.strip()
+            cached_toto_week.clear()
+            cached_oddspapi_board.clear()
+            st.rerun()
+
 st.sidebar.markdown("### Model")
 pseudo = st.sidebar.select_slider(
     "Pseudo-wedstrijden",
@@ -175,7 +224,7 @@ with tabs[0]:
 
     pairs = tuple((str(r.HomeTeam), str(r.AwayTeam)) for r in round_df.itertuples())
     with st.spinner("TOTO odds voor deze ronde ophalen..."):
-        toto_week = cached_toto_week(competition, pairs)
+        toto_week = cached_toto_week(competition, pairs, toto_api_key)
 
     results_by_match = {}
     all_bets = []
@@ -213,6 +262,22 @@ with tabs[0]:
     s3.metric("Pseudo", pseudo)
     linked = int(toto_week.get("_matches_linked", 0))
     s4.metric("TOTO matches gekoppeld", f"{linked}/{len(round_df)}")
+    provider = toto_week.get("_provider", "website")
+    if provider == "structured":
+        st.caption(
+            "TOTO bron: structured TOTO NL odds-feed. Ontbrekende odds betekenen dat TOTO "
+            "die markt op dit moment niet aanbiedt in de feed."
+        )
+    elif provider == "website-fallback":
+        st.warning(
+            "De structured feed kon niet worden gebruikt; de app is teruggevallen op de "
+            "publieke TOTO-pagina. Extra markten achter 'Bekijk meer' kunnen daardoor ontbreken."
+        )
+    else:
+        st.caption(
+            "TOTO bron: publieke website. Voor alle beschikbare markten kun je de complete "
+            "TOTO odds-feed activeren in de sidebar."
+        )
 
     for fixture in round_df.itertuples():
         cands = results_by_match[fixture.Match]
@@ -318,7 +383,7 @@ with tabs[1]:
         )
 
         # Probeer TOTO voor deze ene match te vullen.
-        single_toto = cached_toto_week(bet_comp, ((fixture["HomeTeam"], fixture["AwayTeam"]),))
+        single_toto = cached_toto_week(bet_comp, ((fixture["HomeTeam"], fixture["AwayTeam"]),), toto_api_key)
         toto = toto_week_result_for_match(single_toto, fixture["HomeTeam"], fixture["AwayTeam"])
         selected_df = attach_toto_odds(pd.DataFrame([selected]), toto)
         toto_odd = pd.to_numeric(selected_df.iloc[0].get("TotoOdd"), errors="coerce")

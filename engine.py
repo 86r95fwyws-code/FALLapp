@@ -2389,7 +2389,14 @@ def toto_key_for_candidate(row) -> Optional[str]:
     if category == "Totaal goals" and m:
         return f"TOTAL_{m.group(1).upper()}_{float(m.group(2))}"
 
-    # Teamgoals worden niet overal uniform in de TOTO HTML gepubliceerd.
+    # Via de gestructureerde odds-feed kunnen team totals wél betrouwbaar
+    # worden gekoppeld wanneer TOTO ze voor die wedstrijd aanbiedt.
+    tm = re.search(r"\s(over|under)\s([0-5](?:\.5))$", bet, re.I)
+    if tm and category == "Teamgoals thuis":
+        return f"TEAM_HOME_{tm.group(1).upper()}_{float(tm.group(2))}"
+    if tm and category == "Teamgoals uit":
+        return f"TEAM_AWAY_{tm.group(1).upper()}_{float(tm.group(2))}"
+
     return None
 
 
@@ -2735,3 +2742,455 @@ def season_week_keys(
         + iso["week"].astype(str).str.zfill(2)
     )
     return list(dict.fromkeys(keys.tolist()))
+
+# =============================================================================
+# v1.0.2 — gestructureerde TOTO NL odds-feed
+# =============================================================================
+
+from functools import lru_cache
+import time as _time
+
+ODDSPAPI_BASE = "https://api.oddspapi.io/v4"
+
+# Naam + land is nodig omdat tournamentnamen niet uniek zijn.
+ODDSPAPI_TOURNAMENT_TARGETS = {
+    "Eredivisie": ({"eredivisie"}, {"netherlands", "holland"}),
+    "Premier League": ({"premier league"}, {"england"}),
+    "La Liga": ({"laliga", "la liga"}, {"spain"}),
+    "Bundesliga": ({"bundesliga"}, {"germany"}),
+    "Serie A": ({"serie a"}, {"italy"}),
+    "Ligue 1": ({"ligue 1"}, {"france"}),
+}
+
+
+def _op_norm(value) -> str:
+    return _toto_norm("" if value is None else str(value))
+
+
+def _oddspapi_get(api_key: str, endpoint: str, **params):
+    """
+    GET met respect voor OddsPapi's 429/retryMs response.
+    """
+    if not api_key:
+        raise ValueError("Geen OddsPapi API key ingesteld")
+
+    params = dict(params)
+    params["apiKey"] = api_key
+    url = f"{ODDSPAPI_BASE}/{endpoint.lstrip('/')}"
+
+    last_error = None
+    for attempt in range(5):
+        try:
+            r = requests.get(url, params=params, timeout=45)
+            if r.status_code == 429:
+                retry_ms = 1500
+                try:
+                    body = r.json()
+                    retry_ms = int(
+                        body.get("error", {}).get("retryMs", retry_ms)
+                    )
+                except Exception:
+                    pass
+                _time.sleep(retry_ms / 1000 + 0.25)
+                continue
+            if r.status_code == 404:
+                return []
+            r.raise_for_status()
+            return r.json()
+        except Exception as exc:
+            last_error = exc
+            if attempt < 4:
+                _time.sleep(0.5 + attempt * 0.5)
+
+    raise RuntimeError(
+        f"OddsPapi request mislukt: {type(last_error).__name__ if last_error else 'onbekend'}"
+    )
+
+
+@lru_cache(maxsize=8)
+def oddspapi_soccer_markets(api_key: str) -> dict:
+    rows = _oddspapi_get(
+        api_key, "markets", language="en"
+    )
+    if isinstance(rows, dict):
+        rows = rows.get("data", rows.get("markets", []))
+    return {
+        str(row.get("marketId")): row
+        for row in (rows or [])
+        if row.get("sportId") in (10, "10") or row.get("sportId") is None
+    }
+
+
+@lru_cache(maxsize=8)
+def oddspapi_tournament_ids(api_key: str) -> dict:
+    rows = _oddspapi_get(
+        api_key, "tournaments", sportId=10
+    )
+    if isinstance(rows, dict):
+        rows = rows.get("data", rows.get("tournaments", []))
+
+    found = {}
+    for competition, (names, countries) in ODDSPAPI_TOURNAMENT_TARGETS.items():
+        hits = []
+        for row in rows or []:
+            name = _op_norm(row.get("tournamentName"))
+            country = _op_norm(row.get("categoryName"))
+            if name in names and country in countries:
+                hits.append(row)
+        if hits:
+            # Prefer a tournament that actually reports future/upcoming fixtures.
+            hits.sort(
+                key=lambda x: (
+                    int(x.get("futureFixtures") or 0)
+                    + int(x.get("upcomingFixtures") or 0)
+                ),
+                reverse=True,
+            )
+            found[competition] = int(hits[0]["tournamentId"])
+    return found
+
+
+def _iter_oddspapi_fixtures(payload):
+    if payload is None:
+        return []
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        for key in ("data", "fixtures", "events"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return value
+        # Some endpoint responses can be a single fixture object.
+        if "fixtureId" in payload:
+            return [payload]
+        # Or a dict keyed by fixture IDs.
+        values = [
+            value for value in payload.values()
+            if isinstance(value, dict) and "fixtureId" in value
+        ]
+        if values:
+            return values
+    return []
+
+
+def fetch_oddspapi_toto_board(api_key: str) -> dict:
+    """
+    Eén odds-by-tournaments request haalt de actuele TOTO-prijzen voor alle
+    zes competities tegelijk op.
+    """
+    tournament_ids = oddspapi_tournament_ids(api_key)
+    if not tournament_ids:
+        return {
+            "_status": "Odds-feed: geen competities gevonden",
+            "_fixtures": [],
+        }
+
+    ids = ",".join(
+        str(tournament_ids[c])
+        for c in COMPETITIONS
+        if c in tournament_ids
+    )
+    payload = _oddspapi_get(
+        api_key,
+        "odds-by-tournaments",
+        tournamentIds=ids,
+        bookmakers="toto.nl",
+        language="en",
+        verbosity=3,
+        oddsFormat="decimal",
+    )
+    fixtures = _iter_oddspapi_fixtures(payload)
+    return {
+        "_status": f"Odds-feed: {len(fixtures)} fixtures ontvangen",
+        "_fixtures": fixtures,
+        "_tournament_ids": tournament_ids,
+    }
+
+
+def _active_player_price(players):
+    if not isinstance(players, dict):
+        return np.nan, None
+
+    # Prefer the generic player 0 for normal (non-player-prop) markets.
+    ordered = []
+    if "0" in players:
+        ordered.append(players["0"])
+    ordered.extend(
+        value for key, value in players.items()
+        if key != "0"
+    )
+
+    for item in ordered:
+        # Historical endpoints sometimes return lists; current odds normally dict.
+        candidates = item if isinstance(item, list) else [item]
+        for quote in candidates:
+            if not isinstance(quote, dict):
+                continue
+            price = pd.to_numeric(
+                pd.Series([quote.get("price")]), errors="coerce"
+            ).iloc[0]
+            if pd.notna(price) and price > 1:
+                if quote.get("active", True) is not False:
+                    return float(price), quote.get("bookmakerOutcomeId")
+    return np.nan, None
+
+
+def _market_line(meta: dict, bookmaker_outcome_id=None):
+    line = pd.to_numeric(
+        pd.Series([meta.get("handicap")]), errors="coerce"
+    ).iloc[0]
+    if pd.notna(line):
+        return float(line)
+
+    text = "" if bookmaker_outcome_id is None else str(bookmaker_outcome_id)
+    m = re.search(r"([0-9]+(?:\\.[0-9]+)?)", text)
+    return float(m.group(1)) if m else np.nan
+
+
+def _outcome_side(meta: dict, outcome_id: str, bookmaker_outcome_id=None):
+    for outcome in meta.get("outcomes", []) or []:
+        if str(outcome.get("outcomeId")) == str(outcome_id):
+            return _op_norm(outcome.get("outcomeName"))
+    return _op_norm(bookmaker_outcome_id)
+
+
+def _is_team_one_market(name: str) -> bool:
+    tokens = (
+        "team 1", "team1", "home team", "home total",
+        "participant 1", "participant1"
+    )
+    return any(token in name for token in tokens)
+
+
+def _is_team_two_market(name: str) -> bool:
+    tokens = (
+        "team 2", "team2", "away team", "away total",
+        "participant 2", "participant2"
+    )
+    return any(token in name for token in tokens)
+
+
+def oddspapi_fixture_to_toto_odds(
+    fixture: dict,
+    market_catalog: dict,
+) -> dict:
+    """
+    Vertaal het volledige TOTO bookmakerOdds object naar dezelfde keys die de
+    model-candidates gebruiken. Dit is generiek: line 0.5/1.5/... hoeft niet
+    hardcoded op market-ID te worden.
+    """
+    bookmaker = (fixture.get("bookmakerOdds") or {}).get("toto.nl") or {}
+    markets = bookmaker.get("markets") or {}
+
+    odds = {
+        "_source": "OddsPapi / TOTO NL",
+        "_url": bookmaker.get("fixturePath"),
+        "_updated_at": fixture.get("updatedAt"),
+        "_status": "TOTO structured feed",
+    }
+
+    for market_id, market_data in markets.items():
+        meta = market_catalog.get(str(market_id), {})
+        market_name = _op_norm(meta.get("marketName"))
+        market_type = _op_norm(meta.get("marketType"))
+        period = _op_norm(meta.get("period"))
+
+        # Geen player props voor onze startpagina.
+        if meta.get("playerProp") is True:
+            continue
+        if period and period not in ("fulltime", "full time", "result", "match"):
+            continue
+
+        for outcome_id, outcome_data in (market_data.get("outcomes") or {}).items():
+            price, bookmaker_outcome_id = _active_player_price(
+                outcome_data.get("players") or {}
+            )
+            if pd.isna(price):
+                continue
+
+            side = _outcome_side(
+                meta, str(outcome_id), bookmaker_outcome_id
+            )
+            bo = _op_norm(bookmaker_outcome_id)
+
+            # 1X2
+            if (
+                market_type == "1x2"
+                or "full time result" in market_name
+                or market_name in ("result", "regular time result")
+            ):
+                if side in ("1", "home", "team 1"):
+                    odds["HOME"] = price
+                elif side in ("x", "draw"):
+                    odds["DRAW"] = price
+                elif side in ("2", "away", "team 2"):
+                    odds["AWAY"] = price
+                continue
+
+            # Beide teams scoren
+            if "both teams to score" in market_name or "both team to score" in market_name:
+                if side in ("yes", "ja"):
+                    odds["BTTS_YES"] = price
+                elif side in ("no", "nee"):
+                    odds["BTTS_NO"] = price
+                continue
+
+            # Dubbele kans
+            if "double chance" in market_name:
+                token = side.replace(" ", "")
+                token2 = bo.replace(" ", "")
+                combined = token or token2
+                if combined in ("1x", "homeordraw"):
+                    odds["DC_1X"] = price
+                elif combined in ("x2", "draworaway"):
+                    odds["DC_X2"] = price
+                elif combined in ("12", "homeoraway"):
+                    odds["DC_12"] = price
+                continue
+
+            # Over/Under lijnen.
+            is_total_market = (
+                market_type == "totals"
+                or "over under" in market_name
+                or "total" in market_name
+            )
+            if is_total_market:
+                line = _market_line(meta, bookmaker_outcome_id)
+                if pd.isna(line):
+                    continue
+                # Alleen de lijnen die ons model toont.
+                if line not in (0.5, 1.5, 2.5, 3.5, 4.5, 5.5):
+                    continue
+
+                direction = None
+                if side.startswith("over") or "/over" in bo or bo.endswith("over"):
+                    direction = "OVER"
+                elif side.startswith("under") or "/under" in bo or bo.endswith("under"):
+                    direction = "UNDER"
+                if direction is None:
+                    continue
+
+                if _is_team_one_market(market_name):
+                    odds[f"TEAM_HOME_{direction}_{line}"] = price
+                elif _is_team_two_market(market_name):
+                    odds[f"TEAM_AWAY_{direction}_{line}"] = price
+                else:
+                    # Exclude obvious half/player/team totals accidentally falling through.
+                    if any(
+                        text in market_name
+                        for text in ("1st half", "first half", "2nd half", "second half", "player")
+                    ):
+                        continue
+                    odds[f"TOTAL_{direction}_{line}"] = price
+
+    count = sum(
+        1 for key, value in odds.items()
+        if not key.startswith("_") and pd.notna(value)
+    )
+    odds["_status"] = f"{count} actuele TOTO odds uit structured feed"
+    return odds
+
+
+def _fixture_name_score(fixture: dict, home_team: str, away_team: str) -> float:
+    h = _op_norm(fixture.get("participant1Name") or fixture.get("participant1ShortName"))
+    a = _op_norm(fixture.get("participant2Name") or fixture.get("participant2ShortName"))
+    th = _op_norm(home_team)
+    ta = _op_norm(away_team)
+
+    direct = SequenceMatcher(None, h, th).ratio() + SequenceMatcher(None, a, ta).ratio()
+    reverse = SequenceMatcher(None, h, ta).ratio() + SequenceMatcher(None, a, th).ratio()
+    # Fixture orientation must normally match home/away; penalize reverse.
+    return max(direct, reverse - 0.35)
+
+
+def oddspapi_board_for_matches(
+    board: dict,
+    competition: str,
+    matches,
+    api_key: str,
+) -> dict:
+    market_catalog = oddspapi_soccer_markets(api_key)
+    fixtures = board.get("_fixtures", []) if isinstance(board, dict) else []
+
+    results = {
+        "_status": board.get("_status", "Odds-feed"),
+        "_source": "OddsPapi / TOTO NL",
+        "_matches_requested": len(matches),
+        "_matches_linked": 0,
+    }
+
+    # Restrict tournament when possible.
+    tid = (board.get("_tournament_ids") or {}).get(competition)
+    if tid is not None:
+        fixtures = [
+            f for f in fixtures
+            if int(f.get("tournamentId") or -1) == int(tid)
+        ]
+
+    for home, away in matches:
+        scored = [
+            (_fixture_name_score(f, home, away), f)
+            for f in fixtures
+        ]
+        score, fixture = max(scored, default=(0.0, None), key=lambda x: x[0])
+        key = _toto_match_cache_key(home, away)
+        if fixture is not None and score >= 1.15:
+            parsed = oddspapi_fixture_to_toto_odds(
+                fixture, market_catalog
+            )
+            results[key] = parsed
+            results["_matches_linked"] += 1
+        else:
+            results[key] = {
+                "_status": "Geen TOTO fixture in structured feed",
+                "_source": "OddsPapi / TOTO NL",
+                "_url": None,
+            }
+    return results
+
+
+# Bewaar de directe TOTO-site scraper als fallback.
+_fetch_toto_week_odds_website = fetch_toto_week_odds
+
+
+def fetch_toto_week_odds(
+    competition: str,
+    matches,
+    timeout: int = 10,
+    max_workers: int = 6,
+    api_key: Optional[str] = None,
+    api_board: Optional[dict] = None,
+) -> dict:
+    """
+    Primair: structured TOTO NL feed als API key is ingesteld.
+    Fallback: publieke TOTO website voor de direct zichtbare markten.
+    Er worden nooit twee bronnen door elkaar gemengd binnen één run.
+    """
+    if api_key:
+        try:
+            board = api_board or fetch_oddspapi_toto_board(api_key)
+            structured = oddspapi_board_for_matches(
+                board, competition, matches, api_key
+            )
+            structured["_provider"] = "structured"
+            return structured
+        except Exception as exc:
+            # Alleen als structured feed volledig faalt gebruiken we website.
+            fallback = _fetch_toto_week_odds_website(
+                competition,
+                matches,
+                timeout=timeout,
+                max_workers=max_workers,
+            )
+            fallback["_provider"] = "website-fallback"
+            fallback["_structured_error"] = type(exc).__name__
+            return fallback
+
+    direct = _fetch_toto_week_odds_website(
+        competition,
+        matches,
+        timeout=timeout,
+        max_workers=max_workers,
+    )
+    direct["_provider"] = "website"
+    return direct
